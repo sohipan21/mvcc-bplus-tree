@@ -16,3 +16,12 @@ endif()
 
 # Output binaries to build/bin
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ---- Library target (shared between tests and benchmarks) ----
+add_library(btree_lib STATIC
+    src/btree.cpp
+    src/version_chain.cpp
+    src/mvcc.cpp
+    src/epoch_reclamation.cpp
+)
+target_include_directories(btree_lib PUBLIC include)
