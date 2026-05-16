@@ -17,6 +17,9 @@ endif()
 # Output binaries to build/bin
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# ---- Dependencies ----
+find_package(GTest REQUIRED)
+
 # ---- Library target (shared between tests and benchmarks) ----
 add_library(btree_lib STATIC
     src/btree.cpp
@@ -25,3 +28,14 @@ add_library(btree_lib STATIC
     src/epoch_reclamation.cpp
 )
 target_include_directories(btree_lib PUBLIC include)
+
+# ---- Week 1: single-threaded B+Tree tests ----
+add_executable(test_btree_basic
+    tests/test_btree_basic.cpp
+)
+target_include_directories(test_btree_basic PRIVATE include)
+target_link_libraries(test_btree_basic PRIVATE btree_lib GTest::GTest GTest::Main)
+
+# Enable CTest integration
+include(GoogleTest)
+gtest_discover_tests(test_btree_basic)
