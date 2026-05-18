@@ -21,8 +21,8 @@ struct VersionNode {
 ///
 /// Thread safety:
 ///   - Read() and HasLiveVersion() are lock-free and safe to call from any thread.
-///   - Append and MarkDeleted acquire version_lock_ internally and are safe to
-///     call concurrently.
+///   - All mutating methods (Append, MarkDeleted, UpdateVersion, DeleteVersion, Prune)
+///     acquire version_lock_ internally and are safe to call concurrently.
 class VersionChain {
  public:
   VersionChain() = default;
@@ -37,6 +37,15 @@ class VersionChain {
   /// @brief Mark the current head version as deleted at timestamp ts.
   /// @note Caller must ensure the head exists and is not already deleted.
   void MarkDeleted(uint64_t ts);
+
+  /// @brief Atomically check-mark-append: if head is live, tombstone it and prepend new version.
+  /// @return true if a live version was found and replaced; false if no live version existed.
+  /// @note Eliminates the TOCTOU race between concurrent writers on the same key.
+  bool UpdateVersion(void* value, uint64_t ts);
+
+  /// @brief Atomically tombstone the head version if it is live.
+  /// @return true if a live version was found and deleted; false otherwise.
+  bool DeleteVersion(uint64_t ts);
 
   /// @brief Lock-free point read at snapshot_ts.
   /// @return Value of the first version visible at snapshot_ts, or nullptr if none.

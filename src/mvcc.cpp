@@ -45,8 +45,10 @@ void MVCCTree::Insert(uint64_t key, void* value) {
     chains_.push_back(chain);
   } else {
     auto* chain = static_cast<VersionChain*>(existing);
-    chain->MarkDeleted(ts);
-    chain->Append(value, ts);
+    // UpdateVersion atomically checks for a live head, marks it deleted,
+    // and prepends the new version — all under version_lock_.
+    // If no live version exists, just append (insert-after-delete case).
+    if (!chain->UpdateVersion(value, ts)) chain->Append(value, ts);
   }
   AdvanceEpoch();
 }
@@ -60,9 +62,13 @@ void MVCCTree::Update(uint64_t key, void* value) {
   if (existing == nullptr) return;  // key not present — no-op
 
   auto* chain = static_cast<VersionChain*>(existing);
+  // Single timestamp for both the deletion of the old version and the
+  // creation of the new one. This ensures no visibility gap:
+  //   readers at ts   → see new version (created_at == ts <= ts)
+  //   readers at ts-1 → see old version (deleted_at == ts > ts-1)
+  // UpdateVersion atomically checks+marks+appends under version_lock_.
   uint64_t ts = global_version.fetch_add(1, std::memory_order_release) + 1;
-  chain->MarkDeleted(ts);
-  chain->Append(value, ts);
+  chain->UpdateVersion(value, ts);
   AdvanceEpoch();
 }
 
@@ -75,11 +81,12 @@ bool MVCCTree::Delete(uint64_t key) {
   if (existing == nullptr) return false;
 
   auto* chain = static_cast<VersionChain*>(existing);
-  if (!chain->HasLiveVersion()) return false;
+  // DeleteVersion atomically checks for a live head and marks it deleted
+  // under version_lock_ — no TOCTOU race with concurrent writers.
   uint64_t ts = global_version.fetch_add(1, std::memory_order_release) + 1;
-  chain->MarkDeleted(ts);
+  bool deleted = chain->DeleteVersion(ts);
   AdvanceEpoch();
-  return true;
+  return deleted;
 }
 
 // ---------------------------------------------------------------------------
