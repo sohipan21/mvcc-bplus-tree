@@ -70,6 +70,36 @@ bool VersionChain::HasLiveVersion() const {
 }
 
 // ---------------------------------------------------------------------------
+// UpdateVersion  (atomic check-mark-append under version_lock_)
+// ---------------------------------------------------------------------------
+
+bool VersionChain::UpdateVersion(void* value, uint64_t ts) {
+  VersionNode* new_node = new VersionNode(value, ts, 0);
+  std::lock_guard<std::mutex> lock(version_lock_);
+  VersionNode* head = head_.load(std::memory_order_relaxed);
+  if (head == nullptr || head->deleted_at.load(std::memory_order_relaxed) != 0) {
+    delete new_node;
+    return false;  // no live version to update
+  }
+  head->deleted_at.store(ts, std::memory_order_release);
+  new_node->next.store(head, std::memory_order_relaxed);
+  head_.store(new_node, std::memory_order_release);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// DeleteVersion  (atomic check-mark under version_lock_)
+// ---------------------------------------------------------------------------
+
+bool VersionChain::DeleteVersion(uint64_t ts) {
+  std::lock_guard<std::mutex> lock(version_lock_);
+  VersionNode* head = head_.load(std::memory_order_relaxed);
+  if (head == nullptr || head->deleted_at.load(std::memory_order_relaxed) != 0) return false;
+  head->deleted_at.store(ts, std::memory_order_release);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Prune  (writer path — defers old VersionNodes for EBR reclamation)
 // ---------------------------------------------------------------------------
 

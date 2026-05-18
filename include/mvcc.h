@@ -64,5 +64,7 @@ class MVCCTree {
   std::mutex chains_mutex_;            ///< Protects chains_ for concurrent Insert callers.
   std::vector<VersionChain*> chains_;  ///< All VersionChains; used by destructor and Prune.
 
+  /// @brief Walk all VersionChains and free nodes whose deleted_at timestamp
+  /// is older than the oldest active reader epoch. Call from a background thread.
   void PruneVersionNodes();
 };

@@ -36,6 +36,14 @@ add_executable(test_btree_basic
 target_include_directories(test_btree_basic PRIVATE include)
 target_link_libraries(test_btree_basic PRIVATE btree_lib GTest::GTest GTest::Main)
 
+# ---- Week 2: MVCC layer tests ----
+add_executable(test_mvcc
+    tests/test_mvcc.cpp
+)
+target_include_directories(test_mvcc PRIVATE include)
+target_link_libraries(test_mvcc PRIVATE btree_lib GTest::GTest GTest::Main)
+
 # Enable CTest integration
 include(GoogleTest)
 gtest_discover_tests(test_btree_basic)
+gtest_discover_tests(test_mvcc)
