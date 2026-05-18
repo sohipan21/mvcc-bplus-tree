@@ -114,7 +114,9 @@ bool MVCCTree::Exists(uint64_t key, uint64_t snapshot_ts) const {
 size_t MVCCTree::NumKeys() const { return tree_.Size(); }
 
 // ---------------------------------------------------------------------------
-// PruneVersionNodes
+// PruneVersionNodes — intended for a background thread.
+// Computes the oldest active reader epoch from EBR, then walks
+// all chains and frees VersionNodes whose deleted_at falls below it.
 // ---------------------------------------------------------------------------
 
 void MVCCTree::PruneVersionNodes() {
