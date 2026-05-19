@@ -19,6 +19,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ---- Dependencies ----
 find_package(GTest REQUIRED)
+find_package(benchmark QUIET)
 
 # ---- Library target (shared between tests and benchmarks) ----
 add_library(btree_lib STATIC
@@ -43,7 +44,17 @@ add_executable(test_mvcc
 target_include_directories(test_mvcc PRIVATE include)
 target_link_libraries(test_mvcc PRIVATE btree_lib GTest::GTest GTest::Main)
 
+# ---- Week 3: concurrent / EBR tests ----
+find_package(Threads REQUIRED)
+add_executable(test_concurrent
+    tests/test_concurrent.cpp
+)
+target_include_directories(test_concurrent PRIVATE include)
+target_link_libraries(test_concurrent PRIVATE
+    btree_lib GTest::GTest GTest::Main Threads::Threads)
+
 # Enable CTest integration
 include(GoogleTest)
 gtest_discover_tests(test_btree_basic)
 gtest_discover_tests(test_mvcc)
+gtest_discover_tests(test_concurrent)
