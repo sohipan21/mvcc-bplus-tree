@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test-debug-tsan:
+    name: Debug + ThreadSanitizer
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build libgtest-dev
+          cd /tmp && cmake /usr/src/googletest -B gtest-build
+          cmake --build gtest-build --parallel
+          sudo cmake --install gtest-build
+
+      - name: Build
+        run: |
+          cmake -B build_tsan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_TSAN=ON \
+            -G Ninja
+          cmake --build build_tsan --parallel
+
+      - name: Run tests
+        run: |
+          build_tsan/bin/test_btree_basic
+          build_tsan/bin/test_mvcc
+          build_tsan/bin/test_concurrent
+
+  test-release:
+    name: Release
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build libgtest-dev
+          cd /tmp && cmake /usr/src/googletest -B gtest-build
+          cmake --build gtest-build --parallel
+          sudo cmake --install gtest-build
+
+      - name: Build
+        run: |
+          cmake -B build_release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+          cmake --build build_release --parallel
+
+      - name: Run tests
+        run: |
+          build_release/bin/test_btree_basic
+          build_release/bin/test_mvcc
+          build_release/bin/test_concurrent
