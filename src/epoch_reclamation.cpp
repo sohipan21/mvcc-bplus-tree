@@ -126,9 +126,9 @@ void DeferFreeVersionNode(VersionNode* node) {
 // ---------------------------------------------------------------------------
 
 // Batch counter: only trigger Reclaim() every kReclaimBatch writes.
-// Larger batches reduce lock contention on g_retire_mutex at the cost of
-// holding retired nodes longer. 32 is a reasonable starting point.
-static constexpr int kReclaimBatch = 32;
+// Profiling showed the retire queue was growing too large at 32; halving to 16
+// keeps memory usage bounded without meaningful throughput impact.
+static constexpr int kReclaimBatch = 16;
 static std::atomic<int> g_write_count{0};
 
 void AdvanceEpoch() {
