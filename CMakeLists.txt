@@ -44,6 +44,15 @@ add_executable(test_mvcc
 target_include_directories(test_mvcc PRIVATE include)
 target_link_libraries(test_mvcc PRIVATE btree_lib GTest::GTest GTest::Main)
 
+# ---- Benchmark target (only built if Google Benchmark is found) ----
+if(benchmark_FOUND)
+    add_executable(benchmark_btree
+        benchmarks/benchmark_btree.cpp
+    )
+    target_include_directories(benchmark_btree PRIVATE include)
+    target_link_libraries(benchmark_btree PRIVATE btree_lib benchmark::benchmark pthread)
+endif()
+
 # ---- Week 3: concurrent / EBR tests ----
 find_package(Threads REQUIRED)
 add_executable(test_concurrent
