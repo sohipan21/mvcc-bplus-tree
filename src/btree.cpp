@@ -316,7 +316,7 @@ void BPlusTree::MergeChildren(BPlusNode* parent, int left_index) {
       left->children[lnkeys + i].store(right->children[i].load(relaxed), relaxed);
     }
     left->num_keys.store(lnkeys + rnkeys, release);
-    left->next.store(right->next.load(relaxed), relaxed);
+    left->next.store(right->next.load(relaxed), release);
   } else {
     left->keys[lnkeys].store(parent->keys[left_index].load(relaxed), relaxed);
     for (uint32_t i = 0; i < rnkeys; ++i) {
