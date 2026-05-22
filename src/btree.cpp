@@ -117,6 +117,11 @@ void* BPlusTree::Search(uint64_t key) const {
   return result;
 }
 
+void* BPlusTree::SearchRaw(uint64_t key) const {
+  BPlusNode* r = root_.load(acquire);
+  return SearchNode(r, key);
+}
+
 // ---------------------------------------------------------------------------
 // Insert
 // ---------------------------------------------------------------------------

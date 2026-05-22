@@ -87,6 +87,13 @@ class BPlusTree {
   // Search helpers
   void* SearchNode(const BPlusNode* node, uint64_t key) const;
 
+  /// Like Search() but does NOT call ThreadEnterEpoch/ThreadExitEpoch.
+  /// The caller must hold an active EBR epoch for the duration of the call
+  /// and for as long as the returned pointer is dereferenced.
+  void* SearchRaw(uint64_t key) const;
+
+  friend class MVCCTree;
+
   // Insert helpers
   void InsertNonFull(BPlusNode* node, uint64_t key, void* value);
   void SplitChild(BPlusNode* parent, int child_index, BPlusNode* child);
