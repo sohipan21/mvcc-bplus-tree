@@ -34,6 +34,21 @@ extern EpochSlot g_epoch_slots[kMaxThreads];
 /// Thread-local slot index; -1 means not yet assigned.
 extern thread_local int tl_slot_index;
 
+/// RAII guard that releases the EBR slot back to the pool when a thread exits
+/// without explicitly calling ThreadExitEpoch. Declared here so its destructor
+/// body can reference g_epoch_slots and tl_slot_index without a forward decl.
+struct EpochSlotGuard {
+  ~EpochSlotGuard() {
+    if (tl_slot_index >= 0) {
+      g_epoch_slots[tl_slot_index].epoch.store(kEpochInactive,
+                                               std::memory_order_release);
+      tl_slot_index = -1;
+    }
+  }
+};
+
+extern thread_local EpochSlotGuard tl_epoch_slot_guard;
+
 // ---------------------------------------------------------------------------
 // Thread slot management
 // ---------------------------------------------------------------------------

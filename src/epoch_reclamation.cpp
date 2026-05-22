@@ -15,6 +15,7 @@
 EpochSlot g_epoch_slots[kMaxThreads];
 
 thread_local int tl_slot_index = -1;
+thread_local EpochSlotGuard tl_epoch_slot_guard;
 
 namespace {
 
@@ -58,6 +59,7 @@ int AcquireEpochSlot() {
     if (g_epoch_slots[i].epoch.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
                                                        std::memory_order_relaxed)) {
       tl_slot_index = i;
+      (void)tl_epoch_slot_guard;  // ensure destructor is registered for this thread
       return i;
     }
   }
@@ -81,6 +83,7 @@ void ThreadEnterEpoch(uint64_t snapshot_ts) {
 void ThreadExitEpoch() {
   if (tl_slot_index < 0) return;  // already inactive — idempotent exit is safe
   g_epoch_slots[tl_slot_index].epoch.store(kEpochInactive, std::memory_order_release);
+  tl_slot_index = -1;  // slot is released; guard destructor at thread death will be a no-op
 }
 
 // ---------------------------------------------------------------------------
