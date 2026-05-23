@@ -45,9 +45,6 @@ void MVCCTree::Insert(uint64_t key, void* value) {
     chains_.push_back(chain);
   } else {
     auto* chain = static_cast<VersionChain*>(existing);
-    // UpdateVersion atomically checks for a live head, marks it deleted,
-    // and prepends the new version — all under version_lock_.
-    // If no live version exists, just append (insert-after-delete case).
     if (!chain->UpdateVersion(value, ts)) chain->Append(value, ts);
   }
   AdvanceEpoch();
@@ -62,11 +59,6 @@ void MVCCTree::Update(uint64_t key, void* value) {
   if (existing == nullptr) return;  // key not present — no-op
 
   auto* chain = static_cast<VersionChain*>(existing);
-  // Single timestamp for both the deletion of the old version and the
-  // creation of the new one. This ensures no visibility gap:
-  //   readers at ts   → see new version (created_at == ts <= ts)
-  //   readers at ts-1 → see old version (deleted_at == ts > ts-1)
-  // UpdateVersion atomically checks+marks+appends under version_lock_.
   uint64_t ts = global_version.fetch_add(1, std::memory_order_release) + 1;
   chain->UpdateVersion(value, ts);
   AdvanceEpoch();
@@ -81,8 +73,6 @@ bool MVCCTree::Delete(uint64_t key) {
   if (existing == nullptr) return false;
 
   auto* chain = static_cast<VersionChain*>(existing);
-  // DeleteVersion atomically checks for a live head and marks it deleted
-  // under version_lock_ — no TOCTOU race with concurrent writers.
   uint64_t ts = global_version.fetch_add(1, std::memory_order_release) + 1;
   bool deleted = chain->DeleteVersion(ts);
   AdvanceEpoch();
@@ -94,9 +84,16 @@ bool MVCCTree::Delete(uint64_t key) {
 // ---------------------------------------------------------------------------
 
 void* MVCCTree::Read(uint64_t key, uint64_t snapshot_ts) const {
-  void* existing = tree_.Search(key);
-  if (existing == nullptr) return nullptr;
-  return static_cast<VersionChain*>(existing)->Read(snapshot_ts);
+  // Hold the EBR epoch across both the tree traversal and the version chain
+  // traversal so that PruneVersionNodes cannot free VersionNodes that are
+  // still visible at snapshot_ts while we are reading them.
+  ThreadEnterEpoch(snapshot_ts);
+  void* existing = tree_.SearchRaw(key);
+  void* result = nullptr;
+  if (existing != nullptr)
+    result = static_cast<VersionChain*>(existing)->Read(snapshot_ts);
+  ThreadExitEpoch();
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,9 +111,7 @@ bool MVCCTree::Exists(uint64_t key, uint64_t snapshot_ts) const {
 size_t MVCCTree::NumKeys() const { return tree_.Size(); }
 
 // ---------------------------------------------------------------------------
-// PruneVersionNodes — intended for a background thread.
-// Computes the oldest active reader epoch from EBR, then walks
-// all chains and frees VersionNodes whose deleted_at falls below it.
+// PruneVersionNodes
 // ---------------------------------------------------------------------------
 
 void MVCCTree::PruneVersionNodes() {
