@@ -243,6 +243,28 @@ void BPlusTree::Insert(uint64_t key, void* value) {
   Reclaim();
 }
 
+void* BPlusTree::InsertOrGet(uint64_t key, void* value) {
+  std::lock_guard<std::mutex> lock(write_mutex_);
+  current_write_epoch_ = global_version.load(acquire);
+
+  // SearchNode is safe to call under write_mutex_: no concurrent structural
+  // writer exists, and concurrent lock-free readers do not conflict.
+  BPlusNode* r = root_.load(relaxed);
+  void* existing = SearchNode(r, key);
+  if (existing != nullptr) return existing;
+
+  if (r->IsFull()) {
+    BPlusNode* new_root = AllocateNode(false);
+    new_root->children[0].store(r, relaxed);
+    SplitChild(new_root, 0, r);
+    root_.store(new_root, release);
+    r = new_root;
+  }
+  InsertNonFull(r, key, value);
+  Reclaim();
+  return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Delete
 // ---------------------------------------------------------------------------

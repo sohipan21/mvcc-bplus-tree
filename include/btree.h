@@ -59,6 +59,12 @@ class BPlusTree {
   /// @note Serialized behind write_mutex_; safe to call from multiple threads.
   void Insert(uint64_t key, void* value);
 
+  /// @brief Insert key→value only if key is absent.
+  /// @return nullptr if the key was absent and value was inserted.
+  ///         The existing stored pointer if key was already present (no modification made).
+  /// @note Serialized behind write_mutex_; safe to call from multiple threads.
+  void* InsertOrGet(uint64_t key, void* value);
+
   /// @brief Lock-free point lookup.
   /// @return The stored value pointer, or nullptr if the key is not present.
   /// @note Safe to call concurrently with Insert/Delete and other Search calls.
