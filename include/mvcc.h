@@ -37,6 +37,7 @@ class MVCCTree {
 
   /// @brief Insert key→value. If the key already exists, behaves like Update
   ///        (appends a new version to the existing chain).
+  /// @note Concurrent same-key inserts are safe: InsertOrGet prevents duplicate chains.
   void Insert(uint64_t key, void* value);
 
   /// @brief Overwrite an existing key with a new version.

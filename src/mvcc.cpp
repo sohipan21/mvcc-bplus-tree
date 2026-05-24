@@ -30,7 +30,7 @@ uint64_t MVCCTree::BeginRead() const {
 }
 
 // ---------------------------------------------------------------------------
-// Insert
+// Insert — uses InsertOrGet to prevent duplicate VersionChains under concurrency.
 // ---------------------------------------------------------------------------
 
 void MVCCTree::Insert(uint64_t key, void* value) {
