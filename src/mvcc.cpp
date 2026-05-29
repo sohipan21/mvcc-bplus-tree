@@ -36,14 +36,19 @@ uint64_t MVCCTree::BeginRead() const {
 void MVCCTree::Insert(uint64_t key, void* value) {
   uint64_t ts = global_version.fetch_add(1, std::memory_order_release) + 1;
 
-  void* existing = tree_.Search(key);
+  // Speculatively build a chain, then publish atomically. InsertOrGet installs
+  // ours and returns nullptr when the key was absent; if another thread already
+  // inserted this key (or it pre-existed) it returns the existing chain instead,
+  // closing the Search-then-Insert race that could orphan a chain.
+  auto* fresh = new VersionChain();
+  fresh->Append(value, ts);
+
+  void* existing = tree_.InsertOrGet(key, fresh);
   if (existing == nullptr) {
-    VersionChain* chain = new VersionChain();
-    chain->Append(value, ts);
-    tree_.Insert(key, chain);
     std::lock_guard<std::mutex> lock(chains_mutex_);
-    chains_.push_back(chain);
+    chains_.push_back(fresh);
   } else {
+    delete fresh;  // never published — no reader can reach it
     auto* chain = static_cast<VersionChain*>(existing);
     if (!chain->UpdateVersion(value, ts)) chain->Append(value, ts);
   }
