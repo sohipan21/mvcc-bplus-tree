@@ -27,6 +27,7 @@ static constexpr uint64_t kEpochInactive = std::numeric_limits<uint64_t>::max();
 /// Per-thread epoch slot. alignas(64) prevents false-sharing between slots.
 struct alignas(64) EpochSlot {
   std::atomic<uint64_t> epoch{kEpochInactive};
+  std::atomic<bool> claimed{false};  // ownership flag, distinct from epoch marker
 };
 
 extern EpochSlot g_epoch_slots[kMaxThreads];
@@ -40,8 +41,8 @@ extern thread_local int tl_slot_index;
 struct EpochSlotGuard {
   ~EpochSlotGuard() {
     if (tl_slot_index >= 0) {
-      g_epoch_slots[tl_slot_index].epoch.store(kEpochInactive,
-                                               std::memory_order_release);
+      g_epoch_slots[tl_slot_index].epoch.store(kEpochInactive, std::memory_order_release);
+      g_epoch_slots[tl_slot_index].claimed.store(false, std::memory_order_release);
       tl_slot_index = -1;
     }
   }
