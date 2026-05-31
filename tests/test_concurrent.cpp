@@ -872,3 +872,48 @@ TEST_F(MVCCConcurrentTest, RepeatedWritePruneReadCycle) {
     }
   }
 }
+
+// ===========================================================================
+// Same-key concurrent Insert regression tests
+// ===========================================================================
+
+// 16 threads all Insert the same key simultaneously. Exactly one VersionChain
+// should win the slot; the others must append onto it rather than orphan a chain.
+TEST(InsertRaceTest, ConcurrentSameKeyInsertSingleChain) {
+  constexpr int kThreads = 16;
+  MVCCTree tree;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i]() { tree.Insert(1, V(i + 1)); });
+  }
+  for (auto& th : threads) th.join();
+
+  // One structural key in the tree (not kThreads).
+  EXPECT_EQ(tree.NumKeys(), 1u);
+
+  // The latest snapshot must see a non-null value.
+  uint64_t snap = tree.BeginRead();
+  EXPECT_NE(tree.Read(1, snap), nullptr);
+}
+
+// Same test over a small key set to exercise the contended UpdateVersion path.
+TEST(InsertRaceTest, ConcurrentSameKeySetNoOrphanedChains) {
+  constexpr int kThreads = 8;
+  constexpr uint64_t kKeys = 4;
+  MVCCTree tree;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      for (uint64_t k = 1; k <= kKeys; ++k) tree.Insert(k, V(i * 100 + k));
+    });
+  }
+  for (auto& th : threads) th.join();
+
+  EXPECT_EQ(tree.NumKeys(), kKeys);
+  uint64_t snap = tree.BeginRead();
+  for (uint64_t k = 1; k <= kKeys; ++k) EXPECT_NE(tree.Read(k, snap), nullptr);
+}
