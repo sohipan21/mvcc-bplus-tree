@@ -53,11 +53,12 @@ int AcquireEpochSlot() {
   if (tl_slot_index >= 0) return tl_slot_index;  // already claimed
 
   for (int i = 0; i < kMaxThreads; ++i) {
-    uint64_t expected = kEpochInactive;
-    // Claim by swapping kEpochInactive → 0 (a valid but never-announced epoch).
-    // We'll overwrite with the real snapshot in ThreadEnterEpoch.
-    if (g_epoch_slots[i].epoch.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
-                                                       std::memory_order_relaxed)) {
+    bool expected = false;
+    // Claim via the dedicated ownership flag so a slot can be retained while
+    // its epoch is kEpochInactive (idle between reads) without being stolen.
+    if (g_epoch_slots[i].claimed.compare_exchange_strong(expected, true,
+                                                         std::memory_order_acq_rel,
+                                                         std::memory_order_relaxed)) {
       tl_slot_index = i;
       (void)tl_epoch_slot_guard;  // ensure destructor is registered for this thread
       return i;
@@ -82,8 +83,11 @@ void ThreadEnterEpoch(uint64_t snapshot_ts) {
 
 void ThreadExitEpoch() {
   if (tl_slot_index < 0) return;  // already inactive — idempotent exit is safe
+  // Stop announcing but keep the slot claimed so the next read on this thread
+  // skips the O(kMaxThreads) acquire scan in AcquireEpochSlot. epoch=kEpochInactive
+  // means we no longer hold back reclamation. Full release (claimed=false,
+  // tl_slot_index=-1) happens at thread exit via EpochSlotGuard.
   g_epoch_slots[tl_slot_index].epoch.store(kEpochInactive, std::memory_order_release);
-  tl_slot_index = -1;  // slot is released; guard destructor at thread death will be a no-op
 }
 
 // ---------------------------------------------------------------------------
