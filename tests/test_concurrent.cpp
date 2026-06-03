@@ -917,3 +917,50 @@ TEST(InsertRaceTest, ConcurrentSameKeySetNoOrphanedChains) {
   uint64_t snap = tree.BeginRead();
   for (uint64_t k = 1; k <= kKeys; ++k) EXPECT_NE(tree.Read(k, snap), nullptr);
 }
+
+// ===========================================================================
+// EBR slot retention tests
+// ===========================================================================
+
+// A thread doing many sequential reads must reuse the same slot each time —
+// no re-scan through g_epoch_slots after the first AcquireEpochSlot call.
+TEST(EBRSlotTest, SlotIsRetainedAcrossReads) {
+  MVCCTree tree;
+  int val = 42;
+  tree.Insert(1, &val);
+
+  // Force slot assignment on first read, then verify the index is stable.
+  uint64_t snap = tree.BeginRead();
+  tree.Read(1, snap);
+  int first_slot = tl_slot_index;
+  ASSERT_GE(first_slot, 0) << "slot not assigned after first read";
+
+  for (int i = 0; i < 200; ++i) {
+    snap = tree.BeginRead();
+    tree.Read(1, snap);
+    EXPECT_EQ(tl_slot_index, first_slot) << "slot changed on iteration " << i;
+  }
+}
+
+// Spawning well over kMaxThreads short-lived threads must not exhaust the
+// slot pool — EpochSlotGuard must release each slot at thread exit.
+TEST(EBRSlotTest, SlotPoolNotExhaustedByThreadChurn) {
+  MVCCTree tree;
+  int val = 99;
+  tree.Insert(1, &val);
+
+  // Run 3× kMaxThreads threads sequentially (not concurrently, so the pool
+  // never needs more than one slot at a time).
+  constexpr int kRounds = kMaxThreads * 3;
+  for (int i = 0; i < kRounds; ++i) {
+    std::thread t([&]() {
+      uint64_t snap = tree.BeginRead();
+      volatile void* r = tree.Read(1, snap);
+      (void)r;
+    });
+    t.join();  // destructor releases slot before next iteration
+  }
+  // If we get here without aborting (slot pool exhaustion calls std::abort),
+  // the guard is correctly releasing slots.
+  SUCCEED();
+}
