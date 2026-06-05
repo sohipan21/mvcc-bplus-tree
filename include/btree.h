@@ -99,6 +99,10 @@ class BPlusTree {
   // Search helpers
   void* SearchNode(const BPlusNode* node, uint64_t key) const;
 
+  /// @brief Descend to the leaf node that would contain key.
+  /// Lock-free; caller must hold an active EBR epoch.
+  BPlusNode* FindLeaf(uint64_t key) const;
+
   /// Like Search() but does NOT call ThreadEnterEpoch/ThreadExitEpoch.
   /// The caller must hold an active EBR epoch for the duration of the call
   /// and for as long as the returned pointer is dereferenced.

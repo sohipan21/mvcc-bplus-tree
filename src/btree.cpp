@@ -122,6 +122,17 @@ void* BPlusTree::SearchRaw(uint64_t key) const {
   return SearchNode(r, key);
 }
 
+BPlusNode* BPlusTree::FindLeaf(uint64_t key) const {
+  BPlusNode* node = root_.load(acquire);
+  while (node != nullptr && !node->is_leaf) {
+    uint32_t nkeys = node->num_keys.load(acquire);
+    uint32_t i = 0;
+    while (i < nkeys && key >= node->keys[i].load(relaxed)) ++i;
+    node = static_cast<BPlusNode*>(node->children[i].load(acquire));
+  }
+  return node;
+}
+
 // ---------------------------------------------------------------------------
 // Insert
 // ---------------------------------------------------------------------------
