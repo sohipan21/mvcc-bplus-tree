@@ -7,11 +7,17 @@
 #include <mutex>
 
 /// Fanout: each node holds up to K keys and K+1 child pointers.
+/// K=8 is intentionally small for a demo — production trees use K in the
+/// hundreds so each node fills roughly one memory page. The concurrency
+/// design here is independent of K and scales to any fanout.
 static constexpr size_t K = 8;
 
-/// Cache-line aligned B+Tree node.
-/// All fields that a lock-free reader may access are atomic so that concurrent
-/// read-write access is TSan-clean without the reader ever holding a mutex.
+/// alignas(64) puts each node on a cache-line boundary so adjacent nodes never
+/// share a line, preventing false sharing when two threads access different nodes.
+/// The node itself spans several cache lines; the alignment is about inter-node
+/// isolation, not fitting the whole node into one line.
+/// All fields a lock-free reader touches are atomic, so concurrent reads and
+/// writes are TSan-clean without the reader ever holding a mutex.
 struct alignas(64) BPlusNode {
   /// Leaf chain pointer — links leaf nodes in sorted key order.
   std::atomic<BPlusNode*> next{nullptr};
