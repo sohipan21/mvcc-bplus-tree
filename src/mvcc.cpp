@@ -102,6 +102,22 @@ void* MVCCTree::Read(uint64_t key, uint64_t snapshot_ts) const {
 }
 
 // ---------------------------------------------------------------------------
+// Scan
+// ---------------------------------------------------------------------------
+
+void MVCCTree::Scan(uint64_t lo, uint64_t hi, uint64_t snapshot_ts,
+                    const std::function<void(uint64_t, void*)>& fn) const {
+  // Hold the EBR epoch across the entire leaf-chain walk so PruneVersionNodes
+  // cannot free version nodes that are visible at snapshot_ts mid-scan.
+  ThreadEnterEpoch(snapshot_ts);
+  tree_.Scan(lo, hi, [&](uint64_t key, void* chain_ptr) {
+    void* v = static_cast<VersionChain*>(chain_ptr)->Read(snapshot_ts);
+    if (v != nullptr) fn(key, v);
+  });
+  ThreadExitEpoch();
+}
+
+// ---------------------------------------------------------------------------
 // Exists
 // ---------------------------------------------------------------------------
 

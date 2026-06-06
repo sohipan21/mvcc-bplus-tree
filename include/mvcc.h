@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -55,6 +56,11 @@ class MVCCTree {
 
   /// @brief True if key has a version visible at snapshot_ts.
   bool Exists(uint64_t key, uint64_t snapshot_ts) const;
+
+  /// @brief Call fn(key, value) for every key in [lo, hi] visible at snapshot_ts, ascending.
+  /// Holds the EBR epoch for the whole walk so version nodes can't be freed mid-scan.
+  void Scan(uint64_t lo, uint64_t hi, uint64_t snapshot_ts,
+            const std::function<void(uint64_t, void*)>& fn) const;
 
   /// @brief Number of distinct keys ever inserted (includes fully-deleted keys).
   size_t NumKeys() const;
