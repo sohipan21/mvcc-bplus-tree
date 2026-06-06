@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <numeric>
 #include <random>
 #include <unordered_set>
@@ -946,4 +947,52 @@ TEST(Stress, LargeShuffledInsertDeleteConsistency) {
   std::shuffle(keys.begin(), keys.end(), rng);
   for (auto k : keys) EXPECT_TRUE(t.Delete(k));
   EXPECT_EQ(t.Size(), 0u);
+}
+
+// ===========================================================================
+// Range scan tests
+// ===========================================================================
+
+TEST(Scan, FullRangeMatchesSortedInsertOrder) {
+  BPlusTree t;
+  for (uint64_t k = 1; k <= 50; ++k) t.Insert(k, V(k * 10));
+
+  std::vector<uint64_t> got;
+  t.Scan(1, 50, [&](uint64_t k, void*) { got.push_back(k); });
+
+  ASSERT_EQ(got.size(), 50u);
+  for (uint64_t i = 0; i < 50; ++i) EXPECT_EQ(got[i], i + 1);
+}
+
+TEST(Scan, BoundedRangeReturnsSubset) {
+  BPlusTree t;
+  for (uint64_t k = 1; k <= 100; ++k) t.Insert(k, V(k));
+
+  std::map<uint64_t, uint64_t> ref;
+  for (uint64_t k = 20; k <= 60; ++k) ref[k] = k;
+
+  std::map<uint64_t, uint64_t> got;
+  t.Scan(20, 60, [&](uint64_t k, void* v) { got[k] = U(v); });
+
+  EXPECT_EQ(got, ref);
+}
+
+TEST(Scan, EmptyRangeProducesNoResults) {
+  BPlusTree t;
+  for (uint64_t k = 1; k <= 20; ++k) t.Insert(k, V(k));
+
+  int count = 0;
+  t.Scan(50, 100, [&](uint64_t, void*) { ++count; });
+  EXPECT_EQ(count, 0);
+}
+
+TEST(Scan, AfterDeleteSkipsRemovedKeys) {
+  BPlusTree t;
+  for (uint64_t k = 1; k <= 20; ++k) t.Insert(k, V(k));
+  for (uint64_t k = 1; k <= 20; k += 2) t.Delete(k);  // remove odd keys
+
+  std::vector<uint64_t> got;
+  t.Scan(1, 20, [&](uint64_t k, void*) { got.push_back(k); });
+
+  for (uint64_t k : got) EXPECT_EQ(k % 2, 0u) << "odd key " << k << " survived delete";
 }
