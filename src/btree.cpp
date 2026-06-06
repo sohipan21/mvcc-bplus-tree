@@ -133,6 +133,21 @@ BPlusNode* BPlusTree::FindLeaf(uint64_t key) const {
   return node;
 }
 
+void BPlusTree::Scan(uint64_t lo, uint64_t hi,
+                     const std::function<void(uint64_t, void*)>& fn) const {
+  for (BPlusNode* leaf = FindLeaf(lo); leaf != nullptr;
+       leaf = leaf->next.load(acquire)) {
+    uint32_t nkeys = leaf->num_keys.load(acquire);
+    for (uint32_t i = 0; i < nkeys; ++i) {
+      uint64_t k = leaf->keys[i].load(relaxed);
+      if (k < lo) continue;
+      if (k > hi) return;
+      void* v = leaf->children[i].load(acquire);
+      if (v != nullptr) fn(k, v);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Insert
 // ---------------------------------------------------------------------------

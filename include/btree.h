@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 /// Fanout: each node holds up to K keys and K+1 child pointers.
@@ -83,6 +84,14 @@ class BPlusTree {
 
   /// @brief Number of live keys (relaxed — approximate under concurrent modification).
   size_t Size() const { return size_.load(std::memory_order_relaxed); }
+
+  /// @brief Call fn(key, value) for every key in [lo, hi], ascending order.
+  /// Lock-free: descends to the leaf for lo then walks the leaf chain.
+  /// Caller must hold an active EBR epoch for the duration of the scan.
+  /// Note: a concurrent split can move keys between leaves mid-walk, so this
+  /// is not a structural snapshot — layer MVCC on top for snapshot isolation.
+  void Scan(uint64_t lo, uint64_t hi,
+            const std::function<void(uint64_t, void*)>& fn) const;
 
  private:
   std::atomic<BPlusNode*> root_;
