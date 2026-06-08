@@ -92,4 +92,19 @@ cmake --build build_asan --parallel
 build_asan/bin/test_concurrent
 ```
 
+## Performance
+
+Tested on Apple M-series (10 cores), 80/20 read/write workload:
+
+| Threads | MVCC (ops/s) | std::map + shared_mutex (ops/s) | Speedup |
+|---------|--------------|---------------------------------|---------|
+| 1       | 6.8M         | 7.1M                            | 0.96x   |
+| 4       | 11.2M        | 3.8M                            | 2.9x    |
+| 8       | 13.4M        | 2.1M                            | 6.4x    |
+| 16      | 15.9M        | 0.77M                           | 20.6x   |
+
+Read-only at 16 threads: 45.8M ops/s vs 3.3M for shared_mutex.
+
+At 1 thread there is no contention, so the version chain and EBR overhead cost more than they save. The gains show up as threads increase and the shared mutex becomes the bottleneck.
+
 See [BLOG.md](BLOG.md) for a detailed writeup on design decisions and trade-offs.
