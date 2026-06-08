@@ -561,3 +561,70 @@ TEST_F(MVCCTest, Stress_MixedOps_ConsistentWithReferenceMap) {
     }
   }
 }
+
+// ===========================================================================
+// Snapshot-isolated Scan tests
+// ===========================================================================
+
+TEST_F(MVCCTest, ScanSeesOnlyVersionsAtSnapshot) {
+  MVCCTree t;
+  for (uint64_t k = 1; k <= 10; ++k) t.Insert(k, V(k * 10));
+  uint64_t snap = t.BeginRead();
+  for (uint64_t k = 1; k <= 10; ++k) t.Update(k, V(k * 99));
+
+  std::map<uint64_t, uint64_t> got;
+  t.Scan(1, 10, snap, [&](uint64_t k, void* v) { got[k] = U(v); });
+
+  ASSERT_EQ(got.size(), 10u);
+  for (uint64_t k = 1; k <= 10; ++k) EXPECT_EQ(got[k], k * 10) << "key " << k;
+}
+
+TEST_F(MVCCTest, ScanExcludesDeletedKeys) {
+  MVCCTree t;
+  for (uint64_t k = 1; k <= 10; ++k) t.Insert(k, V(k));
+  for (uint64_t k = 1; k <= 10; k += 2) t.Delete(k);  // delete odd keys
+  uint64_t snap = t.BeginRead();
+
+  std::vector<uint64_t> got;
+  t.Scan(1, 10, snap, [&](uint64_t k, void*) { got.push_back(k); });
+
+  for (uint64_t k : got) EXPECT_EQ(k % 2, 0u) << "deleted odd key " << k << " appeared in scan";
+}
+
+TEST_F(MVCCTest, OldSnapshotScanUnaffectedByNewerWrites) {
+  MVCCTree t;
+  for (uint64_t k = 1; k <= 20; ++k) t.Insert(k, V(k * 10));
+  uint64_t old_snap = t.BeginRead();
+
+  // writes after old_snap
+  for (uint64_t k = 1; k <= 20; ++k) t.Update(k, V(k * 999));
+  t.Delete(5);
+  t.Delete(15);
+
+  std::map<uint64_t, uint64_t> got;
+  t.Scan(1, 20, old_snap, [&](uint64_t k, void* v) { got[k] = U(v); });
+
+  ASSERT_EQ(got.size(), 20u);
+  for (uint64_t k = 1; k <= 20; ++k) EXPECT_EQ(got[k], k * 10);
+}
+
+TEST_F(MVCCTest, ScanMatchesIndividualReadsAtSameSnapshot) {
+  MVCCTree t;
+  for (uint64_t k = 1; k <= 30; ++k) t.Insert(k, V(k * 7));
+  t.Delete(10);
+  t.Delete(20);
+  uint64_t snap = t.BeginRead();
+
+  std::map<uint64_t, uint64_t> scan_result;
+  t.Scan(1, 30, snap, [&](uint64_t k, void* v) { scan_result[k] = U(v); });
+
+  for (uint64_t k = 1; k <= 30; ++k) {
+    void* point = t.Read(k, snap);
+    if (point == nullptr) {
+      EXPECT_EQ(scan_result.count(k), 0u) << "key " << k << " missing from scan but present in Read";
+    } else {
+      ASSERT_EQ(scan_result.count(k), 1u) << "key " << k << " in Read but missing from scan";
+      EXPECT_EQ(scan_result[k], U(point));
+    }
+  }
+}
