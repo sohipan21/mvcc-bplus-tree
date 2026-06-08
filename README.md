@@ -5,7 +5,10 @@ A concurrent B+Tree in C++17 that lets multiple threads read at the same time wi
 The main ideas:
 - **Lock-free reads**: searching the tree never acquires a mutex
 - **Snapshot reads**: each reader gets a consistent point-in-time view, even while writes are happening in parallel
+- **Range scans**: iterate over a key range at a snapshot — results are consistent even with concurrent writes
 - **Safe memory cleanup**: old versions of data are freed automatically once no reader can reach them
+
+Reads are lock-free; structural writes (splits/merges) are serialized behind a single write mutex.
 
 Built as a personal project to get hands-on with C++ atomics, concurrent data structures, and database-style multi-version concurrency control (MVCC).
 
@@ -51,6 +54,11 @@ assert(tree.Read(1, tree.BeginRead()) == &updated); // fresh snapshot sees new v
 
 // Delete
 tree.Delete(1);
+
+// Range scan at a snapshot — only sees versions visible at snap
+tree.Scan(1, 100, snap, [](uint64_t key, void* value) {
+    // called for each key in [1, 100] that existed at snap
+});
 ```
 
 ## How it works
