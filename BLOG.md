@@ -1,4 +1,4 @@
-# Building a Lock-Free B+Tree with MVCC Snapshot Isolation
+# Building an MVCC B+Tree with Snapshot Isolation
 
 A writeup on building a concurrent search tree where reads never block, writes don't block readers, and old versions of data get cleaned up safely. This covers the design decisions, where I went wrong the first time, and what the memory ordering actually needs to be.
 

@@ -1,4 +1,4 @@
-# Lock-Free B+Tree with MVCC
+# MVCC B+Tree
 
 A concurrent B+Tree in C++17 that lets multiple threads read at the same time without blocking each other or blocking writers.
 
