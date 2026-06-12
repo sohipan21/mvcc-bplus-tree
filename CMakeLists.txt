@@ -62,8 +62,17 @@ target_include_directories(test_concurrent PRIVATE include)
 target_link_libraries(test_concurrent PRIVATE
     btree_lib GTest::GTest GTest::Main Threads::Threads)
 
+# ---- Linearizability / strict-consistency stress tests ----
+add_executable(test_linearizability
+    tests/test_linearizability.cpp
+)
+target_include_directories(test_linearizability PRIVATE include)
+target_link_libraries(test_linearizability PRIVATE
+    btree_lib GTest::GTest GTest::Main Threads::Threads)
+
 # Enable CTest integration
 include(GoogleTest)
 gtest_discover_tests(test_btree_basic)
 gtest_discover_tests(test_mvcc)
 gtest_discover_tests(test_concurrent)
+gtest_discover_tests(test_linearizability)
