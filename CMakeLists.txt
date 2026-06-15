@@ -51,6 +51,29 @@ if(benchmark_FOUND)
     )
     target_include_directories(benchmark_btree PRIVATE include)
     target_link_libraries(benchmark_btree PRIVATE btree_lib benchmark::benchmark pthread)
+
+    # Optional: libcuckoo as a fair concurrent-hashmap baseline. Header-only,
+    # fetched at configure time. Guarded by an option so an offline build can
+    # opt out (-DENABLE_LIBCUCKOO=OFF); the cuckoo benchmarks then compile out
+    # via #ifdef HAVE_LIBCUCKOO.
+    option(ENABLE_LIBCUCKOO "Fetch libcuckoo for the concurrent-hashmap baseline" ON)
+    if(ENABLE_LIBCUCKOO)
+        include(FetchContent)
+        # libcuckoo is header-only. Its own CMakeLists declares
+        # cmake_minimum_required(VERSION 3.1.0), which CMake 4.x rejects, so we
+        # point SOURCE_SUBDIR at a non-existent dir to populate the source
+        # WITHOUT running libcuckoo's build, then just add its include path.
+        FetchContent_Declare(
+            libcuckoo
+            GIT_REPOSITORY https://github.com/efficient/libcuckoo.git
+            GIT_TAG v0.3.1
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR _skip_libcuckoo_cmake_
+        )
+        FetchContent_MakeAvailable(libcuckoo)
+        target_include_directories(benchmark_btree SYSTEM PRIVATE ${libcuckoo_SOURCE_DIR})
+        target_compile_definitions(benchmark_btree PRIVATE HAVE_LIBCUCKOO)
+    endif()
 endif()
 
 # ---- Week 3: concurrent / EBR tests ----

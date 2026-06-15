@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <map>
 #include <mutex>
@@ -230,6 +231,170 @@ BENCHMARK(BM_BaselineReadOnly)
     ->Threads(16)
     ->UseRealTime()
     ->MinTime(5.0);
+
+// ---------------------------------------------------------------------------
+// BM_Striped* — std::map sharded into kShards stripes, each guarded by its own
+// shared_mutex. This is the *fair* baseline: unlike the single-shared_mutex
+// version above (which serializes every writer against all readers), striping
+// lets operations on different shards proceed in parallel. It is the standard
+// "global lock doesn't scale, so shard it" answer, and the honest bar the MVCC
+// tree should be measured against.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr size_t kShards = 64;
+
+struct StripedMap {
+  struct alignas(64) Shard {
+    std::map<uint64_t, void*> m;
+    mutable std::shared_mutex mu;
+  };
+  std::array<Shard, kShards> shards;
+
+  Shard& ShardFor(uint64_t key) { return shards[key % kShards]; }
+};
+
+StripedMap* g_striped = nullptr;
+std::once_flag g_striped_flag;
+
+void InitStriped() {
+  g_striped = new StripedMap();
+  for (uint64_t k = 1; k <= kKeySpace; ++k) g_striped->ShardFor(k).m[k] = V(k * 10);
+}
+}  // namespace
+
+static void BM_StripedMixed(benchmark::State& state) {
+  std::call_once(g_striped_flag, InitStriped);
+
+  std::mt19937_64 rng(static_cast<uint64_t>(state.thread_index()) * 6364136223846793005ULL + 1);
+  std::uniform_int_distribution<uint64_t> key_dist(1, kKeySpace);
+  std::bernoulli_distribution is_read(0.80);
+
+  for (auto _ : state) {
+    uint64_t key = key_dist(rng);
+    auto& shard = g_striped->ShardFor(key);
+    if (is_read(rng)) {
+      std::shared_lock<std::shared_mutex> lock(shard.mu);
+      auto it = shard.m.find(key);
+      if (it != shard.m.end()) benchmark::DoNotOptimize(it->second);
+    } else {
+      std::unique_lock<std::shared_mutex> lock(shard.mu);
+      shard.m[key] = V(key);
+    }
+  }
+
+  state.SetItemsProcessed(state.iterations());
+}
+
+BENCHMARK(BM_StripedMixed)
+    ->Threads(1)
+    ->Threads(2)
+    ->Threads(4)
+    ->Threads(8)
+    ->Threads(16)
+    ->UseRealTime()
+    ->MinTime(10.0);
+
+static void BM_StripedReadOnly(benchmark::State& state) {
+  std::call_once(g_striped_flag, InitStriped);
+
+  std::mt19937_64 rng(static_cast<uint64_t>(state.thread_index()) * 6364136223846793005ULL + 1);
+  std::uniform_int_distribution<uint64_t> key_dist(1, kKeySpace);
+
+  for (auto _ : state) {
+    uint64_t key = key_dist(rng);
+    auto& shard = g_striped->ShardFor(key);
+    std::shared_lock<std::shared_mutex> lock(shard.mu);
+    auto it = shard.m.find(key);
+    if (it != shard.m.end()) benchmark::DoNotOptimize(it->second);
+  }
+
+  state.SetItemsProcessed(state.iterations());
+}
+
+BENCHMARK(BM_StripedReadOnly)
+    ->Threads(1)
+    ->Threads(2)
+    ->Threads(4)
+    ->Threads(8)
+    ->Threads(16)
+    ->UseRealTime()
+    ->MinTime(5.0);
+
+// ---------------------------------------------------------------------------
+// BM_Cuckoo* — libcuckoo cuckoohash_map, a production-grade concurrent hash map
+// with fine-grained internal locking. The strongest point-operation baseline.
+// Compiled only when libcuckoo is available (HAVE_LIBCUCKOO). Being a hash map,
+// it has no ordered range scan, so it is a point-read/write comparison only.
+// ---------------------------------------------------------------------------
+
+#ifdef HAVE_LIBCUCKOO
+#include <libcuckoo/cuckoohash_map.hh>
+
+namespace {
+libcuckoo::cuckoohash_map<uint64_t, void*>* g_cuckoo = nullptr;
+std::once_flag g_cuckoo_flag;
+
+void InitCuckoo() {
+  g_cuckoo = new libcuckoo::cuckoohash_map<uint64_t, void*>();
+  for (uint64_t k = 1; k <= kKeySpace; ++k) g_cuckoo->insert(k, V(k * 10));
+}
+}  // namespace
+
+static void BM_CuckooMixed(benchmark::State& state) {
+  std::call_once(g_cuckoo_flag, InitCuckoo);
+
+  std::mt19937_64 rng(static_cast<uint64_t>(state.thread_index()) * 6364136223846793005ULL + 1);
+  std::uniform_int_distribution<uint64_t> key_dist(1, kKeySpace);
+  std::bernoulli_distribution is_read(0.80);
+
+  for (auto _ : state) {
+    uint64_t key = key_dist(rng);
+    if (is_read(rng)) {
+      void* val = nullptr;
+      g_cuckoo->find(key, val);
+      benchmark::DoNotOptimize(val);
+    } else {
+      g_cuckoo->insert_or_assign(key, V(key));
+    }
+  }
+
+  state.SetItemsProcessed(state.iterations());
+}
+
+BENCHMARK(BM_CuckooMixed)
+    ->Threads(1)
+    ->Threads(2)
+    ->Threads(4)
+    ->Threads(8)
+    ->Threads(16)
+    ->UseRealTime()
+    ->MinTime(10.0);
+
+static void BM_CuckooReadOnly(benchmark::State& state) {
+  std::call_once(g_cuckoo_flag, InitCuckoo);
+
+  std::mt19937_64 rng(static_cast<uint64_t>(state.thread_index()) * 6364136223846793005ULL + 1);
+  std::uniform_int_distribution<uint64_t> key_dist(1, kKeySpace);
+
+  for (auto _ : state) {
+    void* val = nullptr;
+    g_cuckoo->find(key_dist(rng), val);
+    benchmark::DoNotOptimize(val);
+  }
+
+  state.SetItemsProcessed(state.iterations());
+}
+
+BENCHMARK(BM_CuckooReadOnly)
+    ->Threads(1)
+    ->Threads(2)
+    ->Threads(4)
+    ->Threads(8)
+    ->Threads(16)
+    ->UseRealTime()
+    ->MinTime(5.0);
+#endif  // HAVE_LIBCUCKOO
 
 // ---------------------------------------------------------------------------
 
