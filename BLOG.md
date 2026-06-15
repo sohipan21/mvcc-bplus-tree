@@ -87,18 +87,37 @@ One thing that has to be careful: when `UpdateVersion()` runs, it marks the old 
 
 ## Benchmark Results
 
-Tested on Apple M-series (10 cores), 80/20 read/write workload:
+Measured on an Apple M-series laptop (10 physical cores), 10k-key space, 80/20 read/write workload. I compare against three baselines instead of one, because a fair comparison matters more than a flattering one:
 
-| Threads | MVCC (ops/s) | std::map + shared_mutex (ops/s) | Speedup |
-|---------|-------------|--------------------------------|---------|
-| 1       | 6.8M        | 7.1M                           | 0.96x   |
-| 4       | 11.2M       | 3.8M                           | 2.9x    |
-| 8       | 13.4M       | 2.1M                           | 6.4x    |
-| 16      | 15.9M       | 0.77M                          | 20.6x   |
+- **1 global lock** — `std::map` + a single `std::shared_mutex`. The naive baseline.
+- **64 shards** — `std::map` split into 64 independently-locked stripes. A *fair ordered* baseline: same data structure, but the global lock is gone.
+- **libcuckoo** — a production concurrent hash map. The strongest point-operation baseline (but a hash map, so no ordered scan).
 
-At 1 thread there is no contention, so the version chain overhead and EBR batching cost more than they save. At 16 threads, `shared_mutex` becomes a bottleneck because every write blocks all readers. The per-key version lock lets unrelated keys proceed in parallel.
+Mixed 80/20 (M ops/s):
 
-Read-only at 16 threads: 45.8M ops/s vs 3.3M for shared_mutex.
+| Threads | MVCC | 1 global lock | 64 shards | libcuckoo |
+|---------|------|---------------|-----------|-----------|
+| 1       | 6.3  | 7.5           | 9.6       | 22.8      |
+| 4       | 16.4 | 1.3           | 10.1      | 30.0      |
+| 8       | 21.8 | 0.6           | 8.2       | 46.8      |
+| 16      | 25.8 | 0.8           | 7.9       | 21.8      |
+
+Read-only (M ops/s):
+
+| Threads | MVCC | 1 global lock | 64 shards | libcuckoo |
+|---------|------|---------------|-----------|-----------|
+| 1       | 9.2  | 8.9           | 10.3      | 31.2      |
+| 4       | 34.5 | 2.8           | 14.5      | 59.1      |
+| 8       | 58.0 | 3.4           | 12.2      | 52.5      |
+| 16      | 77.8 | 3.8           | 12.3      | 20.7      |
+
+The single global lock *collapses* under contention — from 7.5M down to 0.8M on the mixed workload — because every write excludes all readers. Beating it by ~30x is real but uninteresting; that is just what global locks do.
+
+The honest comparison is the **64-shard map**. It removes the global-lock collapse but still doesn't scale: every read takes a `shared_mutex` in shared mode, and the atomic bookkeeping inside `shared_mutex` bounces cache lines between cores. The MVCC tree's reads take *no* lock, so they pull ahead under load — roughly 3x on mixed and 6x read-only at 16 threads. That gap is the entire point of the lock-free read path.
+
+**libcuckoo is the humbling one, and it should be.** A well-tuned concurrent hash map is faster on raw point operations across most of the range — single-threaded it is ~3-4x faster than this tree, because a hash lookup is one probe while a B+Tree lookup chases pointers down several levels and then walks a version chain. The tree's lock-free reads narrow and at high thread counts overtake it here, but I would not lead with that: libcuckoo is a hash map. It has no ordered range scans and no snapshot isolation. Those are the two things this tree is *for*. The right reading of this table is not "the tree is fast," it is "the tree's read path scales like a lock-free structure should, while also giving ordered + versioned reads a hash map can't."
+
+Caveats worth stating: the 16-thread rows oversubscribe a 10-core machine, so they are noisier (libcuckoo visibly dips there). Google Benchmark misreports `mhz_per_cpu` on Apple Silicon, so I ignore it. These are single-run numbers — directional, not publication-grade.
 
 ## Trade-offs and Limitations
 

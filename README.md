@@ -94,17 +94,49 @@ build_asan/bin/test_concurrent
 
 ## Performance
 
-Tested on Apple M-series (10 cores), 80/20 read/write workload:
+Measured on an Apple M-series laptop (10 physical cores), 10k-key space, 80/20
+read/write workload. Four implementations under the same harness:
 
-| Threads | MVCC (ops/s) | std::map + shared_mutex (ops/s) | Speedup |
-|---------|--------------|---------------------------------|---------|
-| 1       | 6.8M         | 7.1M                            | 0.96x   |
-| 4       | 11.2M        | 3.8M                            | 2.9x    |
-| 8       | 13.4M        | 2.1M                            | 6.4x    |
-| 16      | 15.9M        | 0.77M                           | 20.6x   |
+- **MVCC** — this tree (lock-free reads, snapshot isolation)
+- **1 global lock** — `std::map` + a single `std::shared_mutex` (the naive baseline)
+- **64 shards** — `std::map` split into 64 independently-locked stripes (a fair *ordered* baseline)
+- **libcuckoo** — a production concurrent hash map (point ops only; no ordered scan)
 
-Read-only at 16 threads: 45.8M ops/s vs 3.3M for shared_mutex.
+Mixed 80/20 (M ops/s):
 
-At 1 thread there is no contention, so the version chain and EBR overhead cost more than they save. The gains show up as threads increase and the shared mutex becomes the bottleneck.
+| Threads | MVCC | 1 global lock | 64 shards | libcuckoo |
+|---------|------|---------------|-----------|-----------|
+| 1       | 6.3  | 7.5           | 9.6       | 22.8      |
+| 4       | 16.4 | 1.3           | 10.1      | 30.0      |
+| 8       | 21.8 | 0.6           | 8.2       | 46.8      |
+| 16      | 25.8 | 0.8           | 7.9       | 21.8      |
+
+Read-only (M ops/s):
+
+| Threads | MVCC | 1 global lock | 64 shards | libcuckoo |
+|---------|------|---------------|-----------|-----------|
+| 1       | 9.2  | 8.9           | 10.3      | 31.2      |
+| 4       | 34.5 | 2.8           | 14.5      | 59.1      |
+| 8       | 58.0 | 3.4           | 12.2      | 52.5      |
+| 16      | 77.8 | 3.8           | 12.3      | 20.7      |
+
+How to read this honestly:
+
+- **vs. a single global lock:** ~30x faster at 16 threads — but a single global lock is
+  the worst case, so this mostly shows that global locks don't scale, not that the tree is fast.
+- **vs. 64-way sharded `std::map`** (the fair ordered baseline): the tree wins clearly under
+  load — ~3x mixed and ~6x read-only at 16 threads — because its reads take no lock at all,
+  while every shard read still pays `shared_mutex` cache-line traffic. This is the result the
+  design is actually about.
+- **vs. libcuckoo:** a tuned concurrent hash map is faster on raw point operations at low-to-mid
+  concurrency (single-threaded the tree is ~3-4x slower). The tree's lock-free reads close the gap
+  and overtake at high thread counts here, but the honest takeaway is different: libcuckoo is a
+  *hash* map — no ordered range scans, no snapshot isolation. Those two features are the tree's
+  reason to exist, not winning a point-lookup race.
+
+Caveats: the 16-thread rows oversubscribe a 10-core machine, so those points are noisier
+(libcuckoo in particular dips). `mhz_per_cpu` is misreported by Google Benchmark on Apple Silicon
+and is ignored. Numbers are a single run — treat them as directional, and reproduce with
+`build_release/bin/benchmark_btree`.
 
 See [BLOG.md](BLOG.md) for a detailed writeup on design decisions and trade-offs.
