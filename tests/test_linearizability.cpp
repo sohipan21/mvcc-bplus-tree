@@ -18,41 +18,33 @@
 // These differ from tests/test_concurrent.cpp in ONE deliberate way: they
 // assert the STRICT invariant. The concurrent suite checks
 //     if (val != nullptr && U(val) != expected) fail;
-// which TOLERATES a spurious nullptr -- exactly the failure mode produced when
-// a lock-free reader descends an internal node whose key/child arrays are being
-// shifted in place during a merge/borrow (BPlusTree::MergeChildren /
-// BorrowFromLeft / BorrowFromRight publish num_keys with a release store AFTER
-// the relaxed in-place shifts, so a reader that loaded the *old* count has no
-// happens-before edge to the shifted entries and can misroute).
-//
-// A key that is present for the entire run must therefore ALWAYS read back its
-// exact value and NEVER nullptr. Any violation is a real linearizability bug,
-// not a tolerated race. Note: ThreadSanitizer stays clean here because every
-// field is atomic -- it is the ASSERTIONS below, not TSan, that catch the
-// logical misroute. That contrast is the point of this file.
+// which TOLERATES a spurious nullptr. Here, a key that is present for the
+// entire run must ALWAYS read back its exact value and NEVER nullptr. Any
+// violation is a real linearizability bug, not a tolerated race.
 //
 // ---------------------------------------------------------------------------
-// REPRODUCTION STATUS
+// HISTORY: these tests caught a real bug that ThreadSanitizer could not.
 // ---------------------------------------------------------------------------
-// The two structural-churn tests below currently REPRODUCE the bug and are
-// therefore prefixed `DISABLED_` so CI stays green while the fix is scoped
-// separately. They are reliable (failed on 3/3 Debug runs and under TSan), e.g.
+// The original tree mutated internal nodes IN PLACE during merges/borrows:
+// keys[]/children[] were shifted with relaxed stores and num_keys published
+// with a *trailing* release. A reader that had loaded the OLD num_keys had no
+// happens-before edge to those shifts, read a torn separator array, and
+// descended into the wrong subtree -- returning nullptr for a key that was
+// structurally present the whole time, e.g.
 //     Read(61, snap) = 0, expected frozen value 610
-// i.e. a key that is present at the snapshot reads back nullptr. TSan reports
-// ZERO data races on the same run -- demonstrating TSan != linearizability.
+// TSan reported ZERO races on the same runs (every field was atomic), which
+// is exactly the point: data-race freedom != linearizability. The two
+// structural-churn tests below reproduced this reliably and were DISABLED_.
 //
-// Root cause: BPlusTree::MergeChildren / BorrowFromLeft / BorrowFromRight shift
-// an internal node's keys[]/children[] in place with relaxed stores and publish
-// num_keys with a *trailing* release. A reader that loaded the OLD num_keys has
-// no happens-before edge to those shifts, so it reads a torn separator array and
-// descends into the wrong subtree. The leaf-level sibling fallback in SearchNode
-// only rescues right-moving splits, not merges. Fix tracked separately (a B-link
-// high-key on internal nodes would let a misrouted reader recover).
+// The fix: structural writes are now copy-on-write (see btree.cpp). A writer
+// builds fresh nodes for the whole modified path and publishes with a single
+// release store of root_; readers acquire-load root_ once and traverse an
+// immutable snapshot. Torn intermediate states are unrepresentable, so these
+// tests are re-enabled and act as permanent regression guards.
 //
-// Run the disabled repros on demand:
-//     build/bin/test_linearizability --gtest_also_run_disabled_tests
-// MvccScanExactSetUnderValueChurn (value-only, fixed structure) is NOT disabled
-// and must always pass -- it guards MVCC scan snapshot isolation within contract.
+// MvccScanExactSetUnderValueChurn guards MVCC scan snapshot isolation; since
+// the COW rewrite, Scan is also structurally snapshot-consistent (one root
+// load per scan).
 // ===========================================================================
 
 namespace {
@@ -101,14 +93,11 @@ KeyBands MakeBands(uint64_t key_max, uint64_t stride) {
 // ---------------------------------------------------------------------------
 // Test A -- BPlusTree::Search strict presence under structural churn.
 //
-// Targets the suspected internal-node merge/borrow misroute on the lock-free
-// read path directly. Stable keys are structurally present for the whole run,
-// so a correct lock-free reader must find every one of them on every lookup.
+// Regression guard for the internal-node merge/borrow misroute (see HISTORY
+// above). Stable keys are structurally present for the whole run, so a
+// correct lock-free reader must find every one of them on every lookup.
 // ---------------------------------------------------------------------------
-// DISABLED_: currently reproduces the merge/borrow misroute (see REPRODUCTION
-// STATUS at the top of this file). Remove the DISABLED_ prefix once the
-// structural read path is made linearizable.
-TEST(Linearizability, DISABLED_StableKeysAlwaysVisibleUnderStructuralChurn) {
+TEST(Linearizability, StableKeysAlwaysVisibleUnderStructuralChurn) {
   constexpr uint64_t kKeyMax = 1024;
   constexpr uint64_t kStride = 4;  // stable keys: 1, 5, 9, ... (256 of them)
   constexpr int kReaders = 8;
@@ -144,9 +133,9 @@ TEST(Linearizability, DISABLED_StableKeysAlwaysVisibleUnderStructuralChurn) {
         uint64_t key = bands.stable[pick(rng)];
         void* r = tree.Search(key);
         if (U(r) != key * 10) {
-          v.Record("thread " + std::to_string(t) + " iter " + std::to_string(iters) +
-                   ": Search(" + std::to_string(key) + ") = " + std::to_string(U(r)) +
-                   ", expected " + std::to_string(key * 10));
+          v.Record("thread " + std::to_string(t) + " iter " + std::to_string(iters) + ": Search(" +
+                   std::to_string(key) + ") = " + std::to_string(U(r)) + ", expected " +
+                   std::to_string(key * 10));
         }
         ++iters;
       }
@@ -170,10 +159,7 @@ TEST(Linearizability, DISABLED_StableKeysAlwaysVisibleUnderStructuralChurn) {
 // timestamps; and (2) the same lock-free structural descent as Test A, since
 // MVCCTree::Read -> SearchRaw -> SearchNode runs while churn keys split/merge.
 // ---------------------------------------------------------------------------
-// DISABLED_: currently reproduces the same misroute through the MVCC layer (see
-// REPRODUCTION STATUS at the top of this file). Remove the DISABLED_ prefix once
-// the structural read path is made linearizable.
-TEST(Linearizability, DISABLED_MvccSnapshotReadIsStableUnderChurn) {
+TEST(Linearizability, MvccSnapshotReadIsStableUnderChurn) {
   constexpr uint64_t kKeyMax = 1024;
   constexpr uint64_t kStride = 4;
   constexpr int kReaders = 6;
@@ -222,20 +208,18 @@ TEST(Linearizability, DISABLED_MvccSnapshotReadIsStableUnderChurn) {
   writer.join();
   for (auto& th : readers) th.join();
 
-  EXPECT_FALSE(v.hit.load())
-      << "MVCC snapshot read was not frozen / misrouted under churn: " << v.detail;
+  EXPECT_FALSE(v.hit.load()) << "MVCC snapshot read was not frozen / misrouted under churn: "
+                             << v.detail;
 }
 
 // ---------------------------------------------------------------------------
 // Test C -- MVCC Scan exact-set under value-only concurrency.
 //
-// BPlusTree::Scan is documented as NOT a structural snapshot (a concurrent
-// split can move keys between leaves mid-walk -- see btree.h). So we assert the
-// strict exact-set invariant only under VALUE-only concurrency, where the tree
-// structure is fixed and Scan must be exact: writers append new versions to the
-// stable keys, but the snapshot scan must still return exactly the stable set
-// at their original values. This validates MVCC scan snapshot isolation within
-// the layer's actual contract rather than against a non-guarantee.
+// Writers append new versions to the stable keys while a scanner walks the
+// range at a frozen snapshot; the scan must return exactly the stable set at
+// the original values. (Since the copy-on-write rewrite, BPlusTree::Scan is
+// also structurally snapshot-consistent -- it loads root_ once per scan --
+// so this guards the full MVCC visibility contract, not a weakened one.)
 // ---------------------------------------------------------------------------
 TEST(Linearizability, MvccScanExactSetUnderValueChurn) {
   constexpr uint64_t kKeyMax = 1024;

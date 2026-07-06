@@ -81,9 +81,17 @@ bool VersionChain::UpdateVersion(void* value, uint64_t ts) {
     delete new_node;
     return false;  // no live version to update
   }
-  head->deleted_at.store(ts, std::memory_order_release);
+  // Publish the replacement BEFORE tombstoning the old head. In the reverse
+  // order a lock-free reader at snapshot >= ts could load the old head, see
+  // its fresh tombstone, find no successor, and report the key absent — a
+  // state no serial history contains (caught by tests/test_model_check.cpp).
+  // With this order every interleaving is consistent: a reader that loads the
+  // new head sees the new version; one that loaded the old head still sees it
+  // live, which is correct because ts is not yet visible via BeginRead's
+  // commit watermark until this write completes.
   new_node->next.store(head, std::memory_order_relaxed);
   head_.store(new_node, std::memory_order_release);
+  head->deleted_at.store(ts, std::memory_order_release);
   return true;
 }
 

@@ -36,6 +36,7 @@ jobs:
           build_tsan/bin/test_mvcc
           build_tsan/bin/test_concurrent
           build_tsan/bin/test_linearizability
+          build_tsan/bin/test_model_check
 
   test-release:
     name: Release
@@ -65,3 +66,35 @@ jobs:
           build_release/bin/test_mvcc
           build_release/bin/test_concurrent
           build_release/bin/test_linearizability
+          build_release/bin/test_model_check
+
+  test-asan:
+    name: Debug + AddressSanitizer
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build libgtest-dev
+          cd /tmp && cmake /usr/src/googletest -B gtest-build
+          cmake --build gtest-build --parallel
+          sudo cmake --install gtest-build
+
+      - name: Build
+        run: |
+          cmake -B build_asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+            -G Ninja
+          cmake --build build_asan --parallel
+
+      - name: Run tests
+        run: |
+          build_asan/bin/test_btree_basic
+          build_asan/bin/test_mvcc
+          build_asan/bin/test_concurrent
+          build_asan/bin/test_linearizability
+          build_asan/bin/test_model_check

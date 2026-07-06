@@ -93,9 +93,18 @@ target_include_directories(test_linearizability PRIVATE include)
 target_link_libraries(test_linearizability PRIVATE
     btree_lib GTest::GTest GTest::Main Threads::Threads)
 
+# ---- Model-based snapshot-isolation checker ----
+add_executable(test_model_check
+    tests/test_model_check.cpp
+)
+target_include_directories(test_model_check PRIVATE include)
+target_link_libraries(test_model_check PRIVATE
+    btree_lib GTest::GTest GTest::Main Threads::Threads)
+
 # Enable CTest integration
 include(GoogleTest)
 gtest_discover_tests(test_btree_basic)
 gtest_discover_tests(test_mvcc)
 gtest_discover_tests(test_concurrent)
 gtest_discover_tests(test_linearizability)
+gtest_discover_tests(test_model_check)

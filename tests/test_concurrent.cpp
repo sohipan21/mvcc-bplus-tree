@@ -19,8 +19,9 @@ static uint64_t U(void* p) { return reinterpret_cast<uint64_t>(p); }
 
 // ---------------------------------------------------------------------------
 // Fixture: pre-populate tree single-threaded, then read concurrently.
-// Keeping writes and reads in separate phases prevents TSan from flagging
-// accesses to non-atomic fields (num_keys, keys[]) that writers modify.
+// (Since the copy-on-write rewrite, mixed read/write phases are equally safe —
+// readers traverse immutable snapshots; see test_linearizability.cpp for the
+// strict mixed-phase assertions.)
 // ---------------------------------------------------------------------------
 
 class ConcurrentReadTest : public ::testing::Test {
@@ -117,7 +118,8 @@ TEST(EBRTest, SlotAssignmentIsUnique) {
       int s = AcquireEpochSlot();
       slot_results[i].store(s, std::memory_order_relaxed);
       ready.fetch_add(1, std::memory_order_release);
-      while (ready.load(std::memory_order_acquire) < kThreads) {}
+      while (ready.load(std::memory_order_acquire) < kThreads) {
+      }
     });
   }
   for (auto& th : threads) th.join();
@@ -138,14 +140,14 @@ TEST(EBRTest, SlotAssignmentIsUnique) {
 TEST(EBRTest, SafeEpochBoundsActiveReader) {
   // Announce that we are reading at snapshot 5.
   ThreadEnterEpoch(5);
-  uint64_t safe = ComputeSafeEpoch();
+  uint64_t safe = ComputeSafeSnapshot();
   // The safe epoch must not exceed the announced snapshot.
   EXPECT_LE(safe, 5u);
 
   ThreadExitEpoch();
   // After exit no readers are active in this slot; safe epoch should advance
   // (may still be bounded by other test threads, so just check it doesn't crash).
-  uint64_t safe_after = ComputeSafeEpoch();
+  uint64_t safe_after = ComputeSafeSnapshot();
   (void)safe_after;  // value depends on other concurrent tests; just don't crash
 }
 
@@ -595,13 +597,13 @@ TEST(VersionEBRTest, DeferFreeVersionNodeEnqueues) {
 
 TEST(VersionEBRTest, NoReaderAllowsFullReclaim) {
   ThreadExitEpoch();
-  uint64_t safe = ComputeSafeEpoch();
+  uint64_t safe = ComputeSafeSnapshot();
   (void)safe;
 }
 
 TEST(VersionEBRTest, ActiveReaderPreventsReclaim) {
   ThreadEnterEpoch(10);
-  uint64_t safe = ComputeSafeEpoch();
+  uint64_t safe = ComputeSafeSnapshot();
   EXPECT_LE(safe, 10u);
   ThreadExitEpoch();
 }
@@ -963,4 +965,56 @@ TEST(EBRSlotTest, SlotPoolNotExhaustedByThreadChurn) {
   // If we get here without aborting (slot pool exhaustion calls std::abort),
   // the guard is correctly releasing slots.
   SUCCEED();
+}
+
+// ===========================================================================
+// EBR reclamation drain test
+// ===========================================================================
+
+// Copy-on-write structural writes retire O(depth) nodes on EVERY mutation, so
+// reclamation must genuinely run — leaking retired nodes would look "safe" in
+// every other test. This test drives structural churn under concurrent
+// readers (under ASan a premature free surfaces as a use-after-free), then
+// verifies the retire queues DRAIN once all readers quiesce, guarding against
+// a regression where reclamation is silently disabled.
+TEST(EBRReclaimTest, RetireQueueDrainsAfterReadersQuiesce) {
+  BPlusTree tree;
+  constexpr uint64_t kStable = 512;
+  constexpr uint64_t kChurn = 256;
+  constexpr int kReaders = 4;
+  constexpr int kRounds = 20;
+
+  for (uint64_t k = 1; k <= kStable; ++k) tree.Insert(k, V(k));
+
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> readers;
+  readers.reserve(kReaders);
+  for (int t = 0; t < kReaders; ++t) {
+    readers.emplace_back([&, t]() {
+      uint64_t i = 0;
+      while (!stop.load(std::memory_order_acquire)) {
+        uint64_t key = (static_cast<uint64_t>(t) * 31 + i++) % kStable + 1;
+        volatile void* r = tree.Search(key);
+        (void)r;
+      }
+    });
+  }
+
+  // Writer: repeated insert+delete of a churn band forces splits and merges,
+  // retiring a full root-to-leaf path per operation.
+  for (int round = 0; round < kRounds; ++round) {
+    for (uint64_t k = kStable + 1; k <= kStable + kChurn; ++k) tree.Insert(k, V(k));
+    for (uint64_t k = kStable + 1; k <= kStable + kChurn; ++k) tree.Delete(k);
+  }
+
+  stop.store(true, std::memory_order_release);
+  for (auto& th : readers) th.join();
+
+  // Reader threads exited (EpochSlotGuard cleared their announcements) and
+  // this thread announces nothing, so one Reclaim must free every retired
+  // node — from this test and anything earlier tests left behind.
+  ThreadExitEpoch();
+  Reclaim();
+  EXPECT_EQ(RetireQueueSize(), 0u) << "retire queues did not drain after all readers quiesced — "
+                                      "reclamation is not actually running";
 }

@@ -34,6 +34,10 @@ class MVCCTree {
   /// @brief Capture a read snapshot timestamp.
   /// All subsequent Read(key, snapshot) calls using this value will see a
   /// consistent point-in-time view regardless of concurrent writes.
+  /// The returned snapshot is capped below the oldest in-flight commit (the
+  /// commit watermark), so every timestamp <= snapshot belongs to a fully
+  /// published write — snapshot reads are repeatable even while writers are
+  /// mid-commit.
   uint64_t BeginRead() const;
 
   /// @brief Insert key→value. If the key already exists, behaves like Update

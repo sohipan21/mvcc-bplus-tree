@@ -2,41 +2,58 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstring>
-#include <mutex>
+#include <vector>
 
 #include "epoch_reclamation.h"
-#include "mvcc.h"
 
 // ---------------------------------------------------------------------------
-// Memory ordering invariant
+// Copy-on-write invariant
 // ---------------------------------------------------------------------------
 //
-// Writer path (inside write_mutex_):
-//   Intermediate key/children stores use memory_order_relaxed — write_mutex_
-//   ensures no concurrent structural writer. Readers cannot observe partial
-//   state because num_keys.store(release) is the LAST write after all key
-//   and children stores; it acts as the publication fence.
+// Published nodes are immutable. A structural writer (inside write_mutex_):
+//   1. builds fresh copies of every node on the root->leaf path it changes
+//      (plus any sibling consumed by a merge/redistribution),
+//   2. publishes the whole new version with ONE root_.store(release),
+//   3. retires the replaced nodes via DeferFreeNode (EBR, structural clock),
+//   4. advances g_structural_epoch (release).
 //
-// Reader path (SearchNode, lock-free):
-//   num_keys.load(acquire) is the FIRST load on a node. This acquire pairs
-//   with the writer's release on num_keys, establishing happens-before for
-//   all preceding key/children stores. Subsequent keys[i].load(relaxed)
-//   reads are safe because the acquire already guarantees visibility.
+// A reader loads root_ once with acquire. That single acquire pairs with the
+// writer's release store and establishes happens-before for every field of
+// every node reachable from that root — the reader traverses a frozen
+// snapshot and can never observe a half-shifted key array or a torn
+// separator. Reads are linearizable at the root_ load.
 //
-// Stores that MUST remain release:
-//   - num_keys.fetch_add(1, release) / num_keys.store(n, release) — commit
-//   - child->next.store(sibling, release)                        — leaf chain
-//   - parent->children[i].store(ptr, release)                    — tree link
-//   - head_.store(new_node, release)          (in VersionChain)  — version pub
-//   - deleted_at.store(ts, release)           (in VersionChain)  — tombstone
-//
-// Everything else in the writer path is relaxed (inside write_mutex_).
+// Retired nodes stay reachable from OLD snapshots only; EBR frees them once
+// every active reader has announced a structural epoch newer than the
+// retirement (see epoch_reclamation.h).
 // ---------------------------------------------------------------------------
 
 static constexpr auto relaxed = std::memory_order_relaxed;
 static constexpr auto acquire = std::memory_order_acquire;
 static constexpr auto release = std::memory_order_release;
+
+namespace {
+
+constexpr uint32_t kMinKeys = (K - 1) / 2;
+
+/// Index of the child to descend into for key: first i with key < keys[i].
+/// (Descent goes right on key >= keys[i], so child i covers
+/// [keys[i-1], keys[i]) with keys[-1] = -inf and keys[n] = +inf.)
+uint32_t ChildIndex(const BPlusNode* node, uint64_t key) {
+  uint32_t i = 0;
+  while (i < node->num_keys && key >= node->keys[i]) ++i;
+  return i;
+}
+
+/// Fresh copies produced by an insert descent. right != nullptr means the
+/// subtree split and sep must be added to the parent.
+struct SplitResult {
+  BPlusNode* left;
+  BPlusNode* right;
+  uint64_t sep;
+};
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Node lifecycle
@@ -49,12 +66,26 @@ void BPlusTree::FreeNode(BPlusNode* node) { delete node; }
 void BPlusTree::DestroySubtree(BPlusNode* node) {
   if (node == nullptr) return;
   if (!node->is_leaf) {
-    for (uint32_t i = 0; i <= node->num_keys.load(relaxed); ++i) {
-      DestroySubtree(static_cast<BPlusNode*>(node->children[i].load(relaxed)));
+    for (uint32_t i = 0; i <= node->num_keys; ++i) {
+      DestroySubtree(static_cast<BPlusNode*>(node->children[i]));
     }
   }
   FreeNode(node);
 }
+
+namespace {
+
+/// Clone a published node's contents into a fresh (unpublished) node.
+BPlusNode* CopyNode(const BPlusNode* node) {
+  auto* fresh = new BPlusNode(node->is_leaf);
+  fresh->num_keys = node->num_keys;
+  for (uint32_t i = 0; i < node->num_keys; ++i) fresh->keys[i] = node->keys[i];
+  uint32_t nchildren = node->is_leaf ? node->num_keys : node->num_keys + 1;
+  for (uint32_t i = 0; i < nchildren; ++i) fresh->children[i] = node->children[i];
+  return fresh;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
@@ -69,48 +100,33 @@ BPlusTree::~BPlusTree() { DestroySubtree(root_.load(relaxed)); }
 // ---------------------------------------------------------------------------
 
 void* BPlusTree::SearchNode(const BPlusNode* node, uint64_t key) const {
-  // --- Internal node descent ---
+  // Plain (non-atomic) loads throughout: the snapshot rooted at `node` is
+  // immutable, and visibility of all its fields was established by the
+  // acquire load of root_ that produced it.
   while (!node->is_leaf) {
-    uint32_t nkeys = node->num_keys.load(acquire);
-    uint32_t i = 0;
-    while (i < nkeys && key >= node->keys[i].load(relaxed)) ++i;
-    node = static_cast<const BPlusNode*>(node->children[i].load(acquire));
+    node = static_cast<const BPlusNode*>(node->children[ChildIndex(node, key)]);
   }
 
-  // --- Leaf search with sibling fallback ---
-  // If a concurrent split trimmed this leaf's num_keys and moved keys to the
-  // right sibling, the reader follows the leaf chain to find them.
-  while (true) {
-    uint32_t nkeys = node->num_keys.load(acquire);
-    uint32_t lo = 0, hi = nkeys;
-    while (lo < hi) {
-      uint32_t mid = lo + (hi - lo) / 2;
-      uint64_t k = node->keys[mid].load(relaxed);
-      if (k == key) return node->children[mid].load(acquire);
-      if (k < key)
-        lo = mid + 1;
-      else
-        hi = mid;
-    }
-
-    // Key not found in this leaf — check right sibling for a concurrent split.
-    const BPlusNode* sib = node->next.load(acquire);
-    if (sib != nullptr) {
-      uint32_t sib_nkeys = sib->num_keys.load(acquire);
-      if (sib_nkeys > 0 && key >= sib->keys[0].load(relaxed)) {
-        node = sib;
-        continue;
-      }
-    }
-    return nullptr;
+  uint32_t lo = 0, hi = node->num_keys;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    uint64_t k = node->keys[mid];
+    if (k == key) return node->children[mid];
+    if (k < key)
+      lo = mid + 1;
+    else
+      hi = mid;
   }
+  return nullptr;
 }
 
 void* BPlusTree::Search(uint64_t key) const {
-  uint64_t snap = global_version.load(acquire);
-  ThreadEnterEpoch(snap);
+  // kEpochInactive snapshot: a raw tree read needs structural protection only
+  // (it never dereferences version nodes), so it must not hold back version
+  // pruning.
+  ThreadEnterEpoch(kEpochInactive);
 
-  BPlusNode* r = root_.load(acquire);
+  const BPlusNode* r = root_.load(acquire);
   void* result = SearchNode(r, key);
 
   ThreadExitEpoch();
@@ -118,355 +134,363 @@ void* BPlusTree::Search(uint64_t key) const {
 }
 
 void* BPlusTree::SearchRaw(uint64_t key) const {
-  BPlusNode* r = root_.load(acquire);
+  const BPlusNode* r = root_.load(acquire);
   return SearchNode(r, key);
-}
-
-BPlusNode* BPlusTree::FindLeaf(uint64_t key) const {
-  BPlusNode* node = root_.load(acquire);
-  while (node != nullptr && !node->is_leaf) {
-    uint32_t nkeys = node->num_keys.load(acquire);
-    uint32_t i = 0;
-    while (i < nkeys && key >= node->keys[i].load(relaxed)) ++i;
-    node = static_cast<BPlusNode*>(node->children[i].load(acquire));
-  }
-  return node;
 }
 
 void BPlusTree::Scan(uint64_t lo, uint64_t hi,
                      const std::function<void(uint64_t, void*)>& fn) const {
-  for (BPlusNode* leaf = FindLeaf(lo); leaf != nullptr;
-       leaf = leaf->next.load(acquire)) {
-    uint32_t nkeys = leaf->num_keys.load(acquire);
-    for (uint32_t i = 0; i < nkeys; ++i) {
-      uint64_t k = leaf->keys[i].load(relaxed);
-      if (k < lo) continue;
+  // One root load = one structural snapshot for the whole scan. There is no
+  // leaf chain (a chain would link across snapshot versions); instead we
+  // re-descend for the next leaf using the tightest separator above the
+  // current one — O(log n) per leaf boundary within the same snapshot.
+  const BPlusNode* root = root_.load(acquire);
+  uint64_t cursor = lo;
+
+  while (true) {
+    const BPlusNode* node = root;
+    uint64_t bound = 0;
+    bool has_bound = false;  // smallest separator > cursor on the path
+
+    while (!node->is_leaf) {
+      uint32_t i = ChildIndex(node, cursor);
+      if (i < node->num_keys) {
+        bound = node->keys[i];
+        has_bound = true;
+      }
+      node = static_cast<const BPlusNode*>(node->children[i]);
+    }
+
+    for (uint32_t j = 0; j < node->num_keys; ++j) {
+      uint64_t k = node->keys[j];
+      if (k < cursor) continue;
       if (k > hi) return;
-      void* v = leaf->children[i].load(acquire);
+      void* v = node->children[j];
       if (v != nullptr) fn(k, v);
     }
+
+    // All keys >= bound live in the next leaf over; keys in this leaf are
+    // < bound by the separator invariant. Separators strictly increase per
+    // re-descent, so the walk terminates.
+    if (!has_bound || bound > hi) return;
+    cursor = bound;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Insert
+// Insert (copy-on-write)
 // ---------------------------------------------------------------------------
 
-void BPlusTree::SplitChild(BPlusNode* parent, int child_index, BPlusNode* child) {
-  BPlusNode* sibling = AllocateNode(child->is_leaf);
+namespace {
 
-  if (child->is_leaf) {
-    uint32_t split = K - K / 2;
-    uint32_t sib_count = K / 2;
+/// Build the fresh subtree that results from inserting key->value into the
+/// immutable subtree rooted at node. Every replaced original is appended to
+/// `retired`. *added reports whether a new key was created (vs overwrite).
+SplitResult InsertRec(const BPlusNode* node, uint64_t key, void* value, bool* added,
+                      std::vector<BPlusNode*>& retired) {
+  retired.push_back(const_cast<BPlusNode*>(node));
 
-    // 1. Fill sibling (relaxed — not yet visible to readers).
-    for (uint32_t i = 0; i < sib_count; ++i) {
-      sibling->keys[i].store(child->keys[split + i].load(relaxed), relaxed);
-      sibling->children[i].store(child->children[split + i].load(relaxed), relaxed);
-    }
-    sibling->num_keys.store(sib_count, relaxed);
-
-    uint64_t promoted = sibling->keys[0].load(relaxed);
-
-    // 2. Publish sibling into leaf chain (release — readers may follow next).
-    sibling->next.store(child->next.load(relaxed), relaxed);
-    child->next.store(sibling, release);
-
-    // 3. Shift parent's children/keys and publish sibling ptr.
-    uint32_t pnkeys = parent->num_keys.load(relaxed);
-    for (int i = static_cast<int>(pnkeys); i > child_index; --i) {
-      parent->keys[i].store(parent->keys[i - 1].load(relaxed), relaxed);
-      parent->children[i + 1].store(parent->children[i].load(relaxed), release);
-    }
-    parent->keys[child_index].store(promoted, relaxed);
-    parent->children[child_index + 1].store(sibling, release);
-    parent->num_keys.fetch_add(1, release);
-
-    // 4. Trim child LAST — after sibling is reachable from parent and leaf chain.
-    child->num_keys.store(split, release);
-
-  } else {
-    uint32_t mid = K / 2;
-    uint64_t promoted = child->keys[mid].load(relaxed);
-    uint32_t sib_count = K - mid - 1;
-
-    // 1. Fill sibling (relaxed — not yet visible).
-    for (uint32_t i = 0; i < sib_count; ++i) {
-      sibling->keys[i].store(child->keys[mid + 1 + i].load(relaxed), relaxed);
-      sibling->children[i].store(child->children[mid + 1 + i].load(relaxed), relaxed);
-    }
-    sibling->children[sib_count].store(child->children[K].load(relaxed), relaxed);
-    sibling->num_keys.store(sib_count, relaxed);
-
-    // 2. Shift parent and publish sibling ptr.
-    uint32_t pnkeys = parent->num_keys.load(relaxed);
-    for (int i = static_cast<int>(pnkeys); i > child_index; --i) {
-      parent->keys[i].store(parent->keys[i - 1].load(relaxed), relaxed);
-      parent->children[i + 1].store(parent->children[i].load(relaxed), release);
-    }
-    parent->keys[child_index].store(promoted, relaxed);
-    parent->children[child_index + 1].store(sibling, release);
-    parent->num_keys.fetch_add(1, release);
-
-    // 3. Trim child LAST.
-    child->num_keys.store(mid, release);
-  }
-}
-
-void BPlusTree::InsertNonFull(BPlusNode* node, uint64_t key, void* value) {
   if (node->is_leaf) {
-    uint32_t nkeys = node->num_keys.load(relaxed);
-    int i = static_cast<int>(nkeys) - 1;
+    uint64_t tmp_k[K + 1];
+    void* tmp_v[K + 1];
+    uint32_t n = node->num_keys;
 
-    // Overwrite if key already exists.
-    for (uint32_t j = 0; j < nkeys; ++j) {
-      if (node->keys[j].load(relaxed) == key) {
-        node->children[j].store(value, release);
-        return;
+    uint32_t pos = 0;
+    while (pos < n && node->keys[pos] < key) ++pos;
+    bool exists = pos < n && node->keys[pos] == key;
+    *added = !exists;
+
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < pos; ++i, ++total) {
+      tmp_k[total] = node->keys[i];
+      tmp_v[total] = node->children[i];
+    }
+    tmp_k[total] = key;
+    tmp_v[total] = value;
+    ++total;
+    for (uint32_t i = pos + (exists ? 1 : 0); i < n; ++i, ++total) {
+      tmp_k[total] = node->keys[i];
+      tmp_v[total] = node->children[i];
+    }
+
+    if (total <= K) {
+      auto* leaf = new BPlusNode(true);
+      leaf->num_keys = total;
+      for (uint32_t i = 0; i < total; ++i) {
+        leaf->keys[i] = tmp_k[i];
+        leaf->children[i] = tmp_v[i];
       }
+      return {leaf, nullptr, 0};
     }
 
-    // Shift entries right to make room.
-    while (i >= 0 && node->keys[i].load(relaxed) > key) {
-      node->keys[i + 1].store(node->keys[i].load(relaxed), relaxed);
-      node->children[i + 1].store(node->children[i].load(relaxed), relaxed);
-      --i;
+    // Overflow (total == K+1): split into two leaves.
+    uint32_t right_n = total / 2;
+    uint32_t left_n = total - right_n;
+    auto* left = new BPlusNode(true);
+    auto* right = new BPlusNode(true);
+    left->num_keys = left_n;
+    right->num_keys = right_n;
+    for (uint32_t i = 0; i < left_n; ++i) {
+      left->keys[i] = tmp_k[i];
+      left->children[i] = tmp_v[i];
     }
-    node->keys[i + 1].store(key, relaxed);
-    node->children[i + 1].store(value, relaxed);
-    // release: readers acquire-loading num_keys see all prior key/children stores.
-    node->num_keys.fetch_add(1, release);
-    size_.fetch_add(1, relaxed);
-
-  } else {
-    uint32_t nkeys = node->num_keys.load(relaxed);
-    int i = static_cast<int>(nkeys) - 1;
-    while (i >= 0 && node->keys[i].load(relaxed) > key) --i;
-    ++i;
-
-    auto* child = static_cast<BPlusNode*>(node->children[i].load(acquire));
-    if (child->IsFull()) {
-      SplitChild(node, i, child);
-      if (node->keys[i].load(relaxed) <= key) ++i;
+    for (uint32_t i = 0; i < right_n; ++i) {
+      right->keys[i] = tmp_k[left_n + i];
+      right->children[i] = tmp_v[left_n + i];
     }
-    InsertNonFull(static_cast<BPlusNode*>(node->children[i].load(acquire)), key, value);
+    return {left, right, right->keys[0]};
   }
+
+  // Internal node: recurse, then rebuild this node with the fresh child
+  // (and the promoted separator if the child split).
+  uint32_t ci = ChildIndex(node, key);
+  SplitResult child =
+      InsertRec(static_cast<const BPlusNode*>(node->children[ci]), key, value, added, retired);
+
+  uint64_t tmp_k[K + 1];
+  void* tmp_c[K + 2];
+  uint32_t n = node->num_keys;
+  for (uint32_t i = 0; i < n; ++i) tmp_k[i] = node->keys[i];
+  for (uint32_t i = 0; i <= n; ++i) tmp_c[i] = node->children[i];
+  tmp_c[ci] = child.left;
+
+  uint32_t total = n;
+  if (child.right != nullptr) {
+    for (uint32_t i = n; i > ci; --i) tmp_k[i] = tmp_k[i - 1];
+    for (uint32_t i = n + 1; i > ci + 1; --i) tmp_c[i] = tmp_c[i - 1];
+    tmp_k[ci] = child.sep;
+    tmp_c[ci + 1] = child.right;
+    total = n + 1;
+  }
+
+  if (total <= K) {
+    auto* fresh = new BPlusNode(false);
+    fresh->num_keys = total;
+    for (uint32_t i = 0; i < total; ++i) fresh->keys[i] = tmp_k[i];
+    for (uint32_t i = 0; i <= total; ++i) fresh->children[i] = tmp_c[i];
+    return {fresh, nullptr, 0};
+  }
+
+  // Overflow (total == K+1 keys): split, promoting the middle key.
+  uint32_t mid = total / 2;
+  auto* left = new BPlusNode(false);
+  auto* right = new BPlusNode(false);
+  left->num_keys = mid;
+  for (uint32_t i = 0; i < mid; ++i) left->keys[i] = tmp_k[i];
+  for (uint32_t i = 0; i <= mid; ++i) left->children[i] = tmp_c[i];
+  uint32_t right_n = total - mid - 1;
+  right->num_keys = right_n;
+  for (uint32_t i = 0; i < right_n; ++i) right->keys[i] = tmp_k[mid + 1 + i];
+  for (uint32_t i = 0; i <= right_n; ++i) right->children[i] = tmp_c[mid + 1 + i];
+  return {left, right, tmp_k[mid]};
+}
+
+}  // namespace
+
+void BPlusTree::InsertLocked(uint64_t key, void* value) {
+  std::vector<BPlusNode*> retired;
+  bool added = false;
+
+  SplitResult res = InsertRec(root_.load(relaxed), key, value, &added, retired);
+  BPlusNode* new_root = res.left;
+  if (res.right != nullptr) {
+    auto* nr = AllocateNode(false);
+    nr->keys[0] = res.sep;
+    nr->children[0] = res.left;
+    nr->children[1] = res.right;
+    nr->num_keys = 1;
+    new_root = nr;
+  }
+
+  // Single publication point: the entire new tree version becomes visible
+  // atomically. Retire replaced nodes only AFTER the swing, then advance the
+  // structural clock so future readers announce a newer epoch.
+  root_.store(new_root, release);
+  if (added) size_.fetch_add(1, relaxed);
+  for (BPlusNode* n : retired) DeferFreeNode(n);
+  g_structural_epoch.fetch_add(1, release);
+  Reclaim();
 }
 
 void BPlusTree::Insert(uint64_t key, void* value) {
   std::lock_guard<std::mutex> lock(write_mutex_);
-  current_write_epoch_ = global_version.load(acquire);
-
-  BPlusNode* r = root_.load(relaxed);
-  if (r->IsFull()) {
-    BPlusNode* new_root = AllocateNode(false);
-    new_root->children[0].store(r, relaxed);
-    SplitChild(new_root, 0, r);
-    root_.store(new_root, release);
-    r = new_root;
-  }
-  InsertNonFull(r, key, value);
-  Reclaim();
+  InsertLocked(key, value);
 }
 
 void* BPlusTree::InsertOrGet(uint64_t key, void* value) {
   std::lock_guard<std::mutex> lock(write_mutex_);
-  current_write_epoch_ = global_version.load(acquire);
 
-  // SearchNode is safe to call under write_mutex_: no concurrent structural
-  // writer exists, and concurrent lock-free readers do not conflict.
-  BPlusNode* r = root_.load(relaxed);
-  void* existing = SearchNode(r, key);
+  // SearchNode is safe here without an EBR announcement: while we hold
+  // write_mutex_ nothing reachable from the current root can be retired
+  // (retirement only happens inside structural writes, all serialized
+  // behind this mutex), and already-retired nodes are unreachable.
+  void* existing = SearchNode(root_.load(relaxed), key);
   if (existing != nullptr) return existing;
 
-  if (r->IsFull()) {
-    BPlusNode* new_root = AllocateNode(false);
-    new_root->children[0].store(r, relaxed);
-    SplitChild(new_root, 0, r);
-    root_.store(new_root, release);
-    r = new_root;
-  }
-  InsertNonFull(r, key, value);
-  Reclaim();
+  InsertLocked(key, value);
   return nullptr;
 }
 
 // ---------------------------------------------------------------------------
-// Delete
+// Delete (copy-on-write)
 // ---------------------------------------------------------------------------
 
-void BPlusTree::BorrowFromLeft(BPlusNode* parent, int child_index) {
-  auto* child = static_cast<BPlusNode*>(parent->children[child_index].load(acquire));
-  auto* left = static_cast<BPlusNode*>(parent->children[child_index - 1].load(acquire));
+namespace {
 
-  uint32_t cnkeys = child->num_keys.load(relaxed);
-  uint32_t lnkeys = left->num_keys.load(relaxed);
-
-  // Shift child's entries right by one.
-  for (int i = static_cast<int>(cnkeys); i > 0; --i) {
-    child->keys[i].store(child->keys[i - 1].load(relaxed), relaxed);
-    int src = i - 1 + (child->is_leaf ? 0 : 1);
-    int dst = i + (child->is_leaf ? 0 : 1);
-    child->children[dst].store(child->children[src].load(relaxed), relaxed);
+/// True if key is present in the subtree rooted at node.
+bool KeyExists(const BPlusNode* node, uint64_t key) {
+  while (!node->is_leaf) {
+    node = static_cast<const BPlusNode*>(node->children[ChildIndex(node, key)]);
   }
-  if (!child->is_leaf) child->children[1].store(child->children[0].load(relaxed), relaxed);
+  for (uint32_t i = 0; i < node->num_keys; ++i) {
+    if (node->keys[i] == key) return true;
+    if (node->keys[i] > key) return false;
+  }
+  return false;
+}
 
-  if (child->is_leaf) {
-    child->keys[0].store(left->keys[lnkeys - 1].load(relaxed), relaxed);
-    child->children[0].store(left->children[lnkeys - 1].load(relaxed), relaxed);
-    left->num_keys.fetch_sub(1, release);
-    parent->keys[child_index - 1].store(child->keys[0].load(relaxed), relaxed);
+/// Repair an underfull fresh child at parent->children[child_index] by
+/// merging or redistributing with an adjacent sibling. `parent` is fresh
+/// (unpublished) and mutated in place; consumed ORIGINAL siblings go to
+/// `retired`, consumed FRESH nodes are deleted directly (never published).
+void RebalanceChild(BPlusNode* parent, uint32_t child_index, std::vector<BPlusNode*>& retired) {
+  uint32_t sib_index = (child_index > 0) ? child_index - 1 : child_index + 1;
+  uint32_t li = std::min(child_index, sib_index);
+  uint32_t ri = std::max(child_index, sib_index);
+  auto* lc = static_cast<BPlusNode*>(parent->children[li]);
+  auto* rc = static_cast<BPlusNode*>(parent->children[ri]);
+  bool leaf = lc->is_leaf;
+
+  // Gather both children's entries (plus the separator, for internal nodes).
+  uint64_t gk[2 * K + 1];
+  void* gc[2 * K + 2];
+  uint32_t nk = 0, nc = 0;
+
+  if (leaf) {
+    for (uint32_t i = 0; i < lc->num_keys; ++i) {
+      gk[nk++] = lc->keys[i];
+      gc[nc++] = lc->children[i];
+    }
+    for (uint32_t i = 0; i < rc->num_keys; ++i) {
+      gk[nk++] = rc->keys[i];
+      gc[nc++] = rc->children[i];
+    }
   } else {
-    child->keys[0].store(parent->keys[child_index - 1].load(relaxed), relaxed);
-    child->children[0].store(left->children[lnkeys].load(relaxed), relaxed);
-    parent->keys[child_index - 1].store(left->keys[lnkeys - 1].load(relaxed), relaxed);
-    left->num_keys.fetch_sub(1, release);
+    for (uint32_t i = 0; i < lc->num_keys; ++i) gk[nk++] = lc->keys[i];
+    gk[nk++] = parent->keys[li];
+    for (uint32_t i = 0; i < rc->num_keys; ++i) gk[nk++] = rc->keys[i];
+    for (uint32_t i = 0; i <= lc->num_keys; ++i) gc[nc++] = lc->children[i];
+    for (uint32_t i = 0; i <= rc->num_keys; ++i) gc[nc++] = rc->children[i];
   }
-  child->num_keys.fetch_add(1, release);
-}
 
-void BPlusTree::BorrowFromRight(BPlusNode* parent, int child_index) {
-  auto* child = static_cast<BPlusNode*>(parent->children[child_index].load(acquire));
-  auto* right = static_cast<BPlusNode*>(parent->children[child_index + 1].load(acquire));
+  // The child at child_index is the fresh (unpublished) node; the sibling is
+  // an original shared with live snapshots.
+  BPlusNode* fresh_consumed = static_cast<BPlusNode*>(parent->children[child_index]);
+  BPlusNode* original_consumed = static_cast<BPlusNode*>(parent->children[sib_index]);
+  delete fresh_consumed;
+  retired.push_back(original_consumed);
 
-  uint32_t cnkeys = child->num_keys.load(relaxed);
-  uint32_t rnkeys = right->num_keys.load(relaxed);
+  if (nk <= K) {
+    // Merge into a single node; parent loses the separator at li.
+    auto* merged = new BPlusNode(leaf);
+    merged->num_keys = nk;
+    for (uint32_t i = 0; i < nk; ++i) merged->keys[i] = gk[i];
+    for (uint32_t i = 0; i < nc; ++i) merged->children[i] = gc[i];
 
-  if (child->is_leaf) {
-    child->keys[cnkeys].store(right->keys[0].load(relaxed), relaxed);
-    child->children[cnkeys].store(right->children[0].load(relaxed), relaxed);
-    child->num_keys.fetch_add(1, release);
-    for (uint32_t i = 0; i < rnkeys - 1; ++i) {
-      right->keys[i].store(right->keys[i + 1].load(relaxed), relaxed);
-      right->children[i].store(right->children[i + 1].load(relaxed), relaxed);
+    parent->children[li] = merged;
+    for (uint32_t i = li; i + 1 < parent->num_keys; ++i) parent->keys[i] = parent->keys[i + 1];
+    for (uint32_t i = ri; i < parent->num_keys; ++i) parent->children[i] = parent->children[i + 1];
+    parent->num_keys -= 1;
+    return;
+  }
+
+  // Redistribute into two balanced nodes; parent's separator at li updates.
+  auto* nl = new BPlusNode(leaf);
+  auto* nr = new BPlusNode(leaf);
+  uint64_t sep;
+
+  if (leaf) {
+    uint32_t rn = nk / 2;
+    uint32_t ln = nk - rn;
+    nl->num_keys = ln;
+    nr->num_keys = rn;
+    for (uint32_t i = 0; i < ln; ++i) {
+      nl->keys[i] = gk[i];
+      nl->children[i] = gc[i];
     }
-    right->num_keys.fetch_sub(1, release);
-    parent->keys[child_index].store(right->keys[0].load(relaxed), relaxed);
+    for (uint32_t i = 0; i < rn; ++i) {
+      nr->keys[i] = gk[ln + i];
+      nr->children[i] = gc[ln + i];
+    }
+    sep = nr->keys[0];
   } else {
-    child->keys[cnkeys].store(parent->keys[child_index].load(relaxed), relaxed);
-    child->children[cnkeys + 1].store(right->children[0].load(relaxed), relaxed);
-    child->num_keys.fetch_add(1, release);
-    parent->keys[child_index].store(right->keys[0].load(relaxed), relaxed);
-    for (uint32_t i = 0; i < rnkeys - 1; ++i) {
-      right->keys[i].store(right->keys[i + 1].load(relaxed), relaxed);
-      right->children[i].store(right->children[i + 1].load(relaxed), relaxed);
-    }
-    right->children[rnkeys - 1].store(right->children[rnkeys].load(relaxed), relaxed);
-    right->num_keys.fetch_sub(1, release);
+    uint32_t h = nk / 2;  // promoted separator index
+    nl->num_keys = h;
+    for (uint32_t i = 0; i < h; ++i) nl->keys[i] = gk[i];
+    for (uint32_t i = 0; i <= h; ++i) nl->children[i] = gc[i];
+    uint32_t rn = nk - h - 1;
+    nr->num_keys = rn;
+    for (uint32_t i = 0; i < rn; ++i) nr->keys[i] = gk[h + 1 + i];
+    for (uint32_t i = 0; i <= rn; ++i) nr->children[i] = gc[h + 1 + i];
+    sep = gk[h];
   }
+
+  parent->keys[li] = sep;
+  parent->children[li] = nl;
+  parent->children[ri] = nr;
 }
 
-void BPlusTree::MergeChildren(BPlusNode* parent, int left_index) {
-  auto* left = static_cast<BPlusNode*>(parent->children[left_index].load(acquire));
-  auto* right = static_cast<BPlusNode*>(parent->children[left_index + 1].load(acquire));
+/// Build the fresh subtree that results from removing key from the immutable
+/// subtree rooted at node. Precondition: key exists in this subtree.
+BPlusNode* DeleteRec(const BPlusNode* node, uint64_t key, std::vector<BPlusNode*>& retired) {
+  retired.push_back(const_cast<BPlusNode*>(node));
 
-  uint32_t lnkeys = left->num_keys.load(relaxed);
-  uint32_t rnkeys = right->num_keys.load(relaxed);
-
-  if (left->is_leaf) {
-    for (uint32_t i = 0; i < rnkeys; ++i) {
-      left->keys[lnkeys + i].store(right->keys[i].load(relaxed), relaxed);
-      left->children[lnkeys + i].store(right->children[i].load(relaxed), relaxed);
-    }
-    left->num_keys.store(lnkeys + rnkeys, release);
-    left->next.store(right->next.load(relaxed), release);
-  } else {
-    left->keys[lnkeys].store(parent->keys[left_index].load(relaxed), relaxed);
-    for (uint32_t i = 0; i < rnkeys; ++i) {
-      left->keys[lnkeys + 1 + i].store(right->keys[i].load(relaxed), relaxed);
-      left->children[lnkeys + 1 + i].store(right->children[i].load(relaxed), relaxed);
-    }
-    left->children[lnkeys + 1 + rnkeys].store(right->children[rnkeys].load(relaxed), relaxed);
-    left->num_keys.store(lnkeys + rnkeys + 1, release);
-  }
-
-  uint32_t pnkeys = parent->num_keys.load(relaxed);
-  for (uint32_t i = static_cast<uint32_t>(left_index); i < pnkeys - 1; ++i) {
-    parent->keys[i].store(parent->keys[i + 1].load(relaxed), relaxed);
-    parent->children[i + 1].store(parent->children[i + 2].load(relaxed), relaxed);
-  }
-  parent->num_keys.fetch_sub(1, release);
-
-  DeferFreeNode(right);
-}
-
-void BPlusTree::FixUnderflow(BPlusNode* parent, int child_index) {
-  auto* child = static_cast<BPlusNode*>(parent->children[child_index].load(acquire));
-  if (child->num_keys.load(relaxed) >= kMinKeys) return;
-
-  uint32_t pnkeys = parent->num_keys.load(relaxed);
-  bool has_left = child_index > 0;
-  bool has_right = child_index < static_cast<int>(pnkeys);
-
-  if (has_left) {
-    auto* left = static_cast<BPlusNode*>(parent->children[child_index - 1].load(acquire));
-    if (left->num_keys.load(relaxed) > kMinKeys) {
-      BorrowFromLeft(parent, child_index);
-      return;
-    }
-  }
-  if (has_right) {
-    auto* right = static_cast<BPlusNode*>(parent->children[child_index + 1].load(acquire));
-    if (right->num_keys.load(relaxed) > kMinKeys) {
-      BorrowFromRight(parent, child_index);
-      return;
-    }
-  }
-
-  if (has_left)
-    MergeChildren(parent, child_index - 1);
-  else
-    MergeChildren(parent, child_index);
-}
-
-bool BPlusTree::DeleteFromNode(BPlusNode* node, BPlusNode* parent, int parent_index, uint64_t key) {
   if (node->is_leaf) {
-    uint32_t nkeys = node->num_keys.load(relaxed);
-    for (uint32_t i = 0; i < nkeys; ++i) {
-      if (node->keys[i].load(relaxed) == key) {
-        for (uint32_t j = i; j < nkeys - 1; ++j) {
-          node->keys[j].store(node->keys[j + 1].load(relaxed), relaxed);
-          node->children[j].store(node->children[j + 1].load(relaxed), relaxed);
-        }
-        node->num_keys.fetch_sub(1, release);
-        size_.fetch_sub(1, relaxed);
-        if (parent != nullptr) FixUnderflow(parent, parent_index);
-        return true;
-      }
-      if (node->keys[i].load(relaxed) > key) break;
+    auto* fresh = new BPlusNode(true);
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < node->num_keys; ++i) {
+      if (node->keys[i] == key) continue;
+      fresh->keys[out] = node->keys[i];
+      fresh->children[out] = node->children[i];
+      ++out;
     }
-    return false;
+    fresh->num_keys = out;
+    return fresh;
   }
 
-  uint32_t nkeys = node->num_keys.load(relaxed);
-  uint32_t i = 0;
-  while (i < nkeys && key >= node->keys[i].load(relaxed)) ++i;
+  uint32_t ci = ChildIndex(node, key);
+  BPlusNode* fresh_child =
+      DeleteRec(static_cast<const BPlusNode*>(node->children[ci]), key, retired);
 
-  auto* child = static_cast<BPlusNode*>(node->children[i].load(acquire));
-  bool found = DeleteFromNode(child, node, static_cast<int>(i), key);
+  BPlusNode* fresh = CopyNode(node);
+  fresh->children[ci] = fresh_child;
 
-  if (!found) return false;
-
-  if (parent != nullptr) FixUnderflow(parent, parent_index);
-  return true;
+  if (fresh_child->num_keys < kMinKeys) RebalanceChild(fresh, ci, retired);
+  return fresh;
 }
+
+}  // namespace
 
 bool BPlusTree::Delete(uint64_t key) {
   std::lock_guard<std::mutex> lock(write_mutex_);
-  current_write_epoch_ = global_version.load(acquire);
 
-  if (size_.load(relaxed) == 0) return false;
+  BPlusNode* old_root = root_.load(relaxed);
+  if (!KeyExists(old_root, key)) return false;
 
-  bool found = DeleteFromNode(root_.load(relaxed), nullptr, 0, key);
+  std::vector<BPlusNode*> retired;
+  BPlusNode* new_root = DeleteRec(old_root, key, retired);
 
-  BPlusNode* r = root_.load(relaxed);
-  if (!r->is_leaf && r->num_keys.load(relaxed) == 0) {
-    BPlusNode* new_root = static_cast<BPlusNode*>(r->children[0].load(relaxed));
-    root_.store(new_root, release);
-    r->children[0].store(nullptr, relaxed);
-    DeferFreeNode(r);
+  // Collapse an empty internal root: publish its single child as the root.
+  if (!new_root->is_leaf && new_root->num_keys == 0) {
+    auto* collapsed = static_cast<BPlusNode*>(new_root->children[0]);
+    FreeNode(new_root);  // fresh and never published — no reader can hold it
+    new_root = collapsed;
   }
 
+  root_.store(new_root, release);
+  size_.fetch_sub(1, relaxed);
+  for (BPlusNode* n : retired) DeferFreeNode(n);
+  g_structural_epoch.fetch_add(1, release);
   Reclaim();
-  return found;
+  return true;
 }

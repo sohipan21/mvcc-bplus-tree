@@ -12,6 +12,10 @@
 // Global state
 // ---------------------------------------------------------------------------
 
+// Structural clock starts at 1 so a freshly retired node (stamped >= 1) can
+// never be confused with a zero-initialized announcement.
+std::atomic<uint64_t> g_structural_epoch{1};
+
 EpochSlot g_epoch_slots[kMaxThreads];
 
 thread_local int tl_slot_index = -1;
@@ -25,12 +29,16 @@ namespace {
 std::once_flag g_slots_init_flag;
 
 void InitSlots() {
-  for (int i = 0; i < kMaxThreads; ++i)
+  for (int i = 0; i < kMaxThreads; ++i) {
     g_epoch_slots[i].epoch.store(kEpochInactive, std::memory_order_relaxed);
+    g_epoch_slots[i].structural_epoch.store(kEpochInactive, std::memory_order_relaxed);
+    g_epoch_slots[i].commit_ts.store(kEpochInactive, std::memory_order_relaxed);
+  }
 }
 
-// Retire queue — protected by g_retire_mutex.
-// Reclamation bookkeeping uses a mutex (only the read traversal is lock-free).
+// Retire queues — protected by g_retire_mutex. Two queues because the two
+// object kinds are stamped with DIFFERENT clocks (structural vs snapshot);
+// comparing a structural stamp against a snapshot minimum would be meaningless.
 struct RetiredItem {
   void* ptr;
   void (*deleter)(void*);
@@ -38,7 +46,24 @@ struct RetiredItem {
 };
 
 std::mutex g_retire_mutex;
-std::vector<RetiredItem> g_retire_queue;
+std::vector<RetiredItem> g_retire_nodes;     // stamped with g_structural_epoch
+std::vector<RetiredItem> g_retire_versions;  // stamped with global_version
+
+// Frees every item whose stamp is older than `safe`; keeps the rest.
+// safe == kEpochInactive means no active readers on that clock: free all.
+void DrainQueue(std::vector<RetiredItem>& queue, uint64_t safe) {
+  if (queue.empty()) return;
+  std::vector<RetiredItem> survivors;
+  survivors.reserve(queue.size());
+  for (auto& item : queue) {
+    if (safe == kEpochInactive || item.retired_epoch < safe) {
+      item.deleter(item.ptr);
+    } else {
+      survivors.push_back(item);
+    }
+  }
+  queue = std::move(survivors);
+}
 
 }  // namespace
 
@@ -55,9 +80,8 @@ int AcquireEpochSlot() {
   for (int i = 0; i < kMaxThreads; ++i) {
     bool expected = false;
     // Claim via the dedicated ownership flag so a slot can be retained while
-    // its epoch is kEpochInactive (idle between reads) without being stolen.
-    if (g_epoch_slots[i].claimed.compare_exchange_strong(expected, true,
-                                                         std::memory_order_acq_rel,
+    // its epochs are kEpochInactive (idle between reads) without being stolen.
+    if (g_epoch_slots[i].claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
                                                          std::memory_order_relaxed)) {
       tl_slot_index = i;
       (void)tl_epoch_slot_guard;  // ensure destructor is registered for this thread
@@ -75,26 +99,53 @@ int AcquireEpochSlot() {
 
 void ThreadEnterEpoch(uint64_t snapshot_ts) {
   AcquireEpochSlot();
-  // seq_cst: full fence so no tree-traversal load can be reordered before this
-  // announcement. Without it a writer could observe no active readers, advance
-  // the safe epoch, free a node, and then we'd dereference freed memory.
+  // acquire on the structural clock: pairs with the writer's release
+  // fetch_add after a root swing, so announcing epoch E guarantees we see
+  // every root published up through E — we can never reach a node retired
+  // before E became current.
+  uint64_t structural = g_structural_epoch.load(std::memory_order_acquire);
+  // seq_cst stores: full fences so no traversal load can be reordered before
+  // the announcements are globally visible. Without them a reclaimer could
+  // observe no active readers, free a node, and we'd dereference freed
+  // memory. (Reclaim side pairs with a seq_cst fence in ComputeSafe*.)
+  g_epoch_slots[tl_slot_index].structural_epoch.store(structural, std::memory_order_seq_cst);
   g_epoch_slots[tl_slot_index].epoch.store(snapshot_ts, std::memory_order_seq_cst);
 }
 
 void ThreadExitEpoch() {
   if (tl_slot_index < 0) return;  // already inactive — idempotent exit is safe
   // Stop announcing but keep the slot claimed so the next read on this thread
-  // skips the O(kMaxThreads) acquire scan in AcquireEpochSlot. epoch=kEpochInactive
-  // means we no longer hold back reclamation. Full release (claimed=false,
-  // tl_slot_index=-1) happens at thread exit via EpochSlotGuard.
+  // skips the O(kMaxThreads) acquire scan in AcquireEpochSlot. Release stores:
+  // a reclaimer that acquire-loads kEpochInactive gets a happens-before edge
+  // over every traversal load we made, so freeing after that is race-free.
+  // Full release (claimed=false, tl_slot_index=-1) happens at thread exit via
+  // EpochSlotGuard.
   g_epoch_slots[tl_slot_index].epoch.store(kEpochInactive, std::memory_order_release);
+  g_epoch_slots[tl_slot_index].structural_epoch.store(kEpochInactive, std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------
-// ComputeSafeEpoch
+// ComputeSafeStructuralEpoch / ComputeSafeSnapshot
 // ---------------------------------------------------------------------------
 
-uint64_t ComputeSafeEpoch() {
+// Both scans start with a seq_cst fence pairing with the seq_cst announcement
+// stores in ThreadEnterEpoch (Dekker-style): either the scan observes a
+// reader's announcement, or that reader's traversal loads are ordered after
+// the scan — meaning the reader observed the post-retirement state and cannot
+// hold a pointer into anything the scan approves for freeing.
+
+uint64_t ComputeSafeStructuralEpoch() {
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  uint64_t safe = kEpochInactive;
+  for (int i = 0; i < kMaxThreads; ++i) {
+    uint64_t e = g_epoch_slots[i].structural_epoch.load(std::memory_order_acquire);
+    if (e != kEpochInactive && e < safe) safe = e;
+  }
+  return safe;
+}
+
+uint64_t ComputeSafeSnapshot() {
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   uint64_t safe = kEpochInactive;
   for (int i = 0; i < kMaxThreads; ++i) {
     uint64_t e = g_epoch_slots[i].epoch.load(std::memory_order_acquire);
@@ -107,25 +158,27 @@ uint64_t ComputeSafeEpoch() {
 // DeferredFree / DeferFreeNode / DeferFreeVersionNode
 // ---------------------------------------------------------------------------
 
-// Internal helper: enqueue with a typed deleter and the current global_version.
-static void EnqueueRetired(void* ptr, void (*deleter)(void*)) {
+// Spec-required signature. Since we don't know the type here, this path is only
+// safe for plain-delete objects. Prefer the typed helpers below.
+void DeferredFree(void* ptr) {
   uint64_t epoch = global_version.load(std::memory_order_acquire);
   std::lock_guard<std::mutex> lock(g_retire_mutex);
-  g_retire_queue.push_back({ptr, deleter, epoch});
-}
-
-// Spec-required signature. Since we don't know the type here, this path is only
-// safe for plain-delete objects. Prefer DeferFreeNode for BPlusNode.
-void DeferredFree(void* ptr) {
-  EnqueueRetired(ptr, [](void* p) { ::operator delete(p); });
+  g_retire_versions.push_back({ptr, [](void* p) { ::operator delete(p); }, epoch});
 }
 
 void DeferFreeNode(BPlusNode* node) {
-  EnqueueRetired(node, [](void* p) { delete static_cast<BPlusNode*>(p); });
+  // Stamp with the CURRENT structural epoch: the node was still reachable
+  // during this epoch, so it may be freed only once every active reader has
+  // announced a strictly newer one.
+  uint64_t epoch = g_structural_epoch.load(std::memory_order_acquire);
+  std::lock_guard<std::mutex> lock(g_retire_mutex);
+  g_retire_nodes.push_back({node, [](void* p) { delete static_cast<BPlusNode*>(p); }, epoch});
 }
 
 void DeferFreeVersionNode(VersionNode* node) {
-  EnqueueRetired(node, [](void* p) { delete static_cast<VersionNode*>(p); });
+  uint64_t epoch = global_version.load(std::memory_order_acquire);
+  std::lock_guard<std::mutex> lock(g_retire_mutex);
+  g_retire_versions.push_back({node, [](void* p) { delete static_cast<VersionNode*>(p); }, epoch});
 }
 
 // ---------------------------------------------------------------------------
@@ -143,24 +196,15 @@ void AdvanceEpoch() {
 }
 
 void Reclaim() {
-  uint64_t safe = ComputeSafeEpoch();
-  if (safe == 0) return;  // nothing can be safely freed yet
+  uint64_t safe_structural = ComputeSafeStructuralEpoch();
+  uint64_t safe_snapshot = ComputeSafeSnapshot();
 
   std::lock_guard<std::mutex> lock(g_retire_mutex);
-  if (g_retire_queue.empty()) return;
+  DrainQueue(g_retire_nodes, safe_structural);
+  DrainQueue(g_retire_versions, safe_snapshot);
+}
 
-  std::vector<RetiredItem> survivors;
-  survivors.reserve(g_retire_queue.size());
-
-  for (auto& item : g_retire_queue) {
-    // Free if retired before the oldest active reader's snapshot.
-    // safe == kEpochInactive means no active readers — free everything.
-    if (safe == kEpochInactive || item.retired_epoch < safe) {
-      item.deleter(item.ptr);
-    } else {
-      survivors.push_back(item);
-    }
-  }
-
-  g_retire_queue = std::move(survivors);
+size_t RetireQueueSize() {
+  std::lock_guard<std::mutex> lock(g_retire_mutex);
+  return g_retire_nodes.size() + g_retire_versions.size();
 }
